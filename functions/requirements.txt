@@ -1,0 +1,4 @@
+functions-framework==3.5.0
+google-cloud-firestore==2.11.1
+# REMOVE THIS LINE if it's there: protobuf==4.25.8
+# REMOVE THIS LINE if it's there: firebase_functions~=0.1.0

@@ -1,0 +1,9 @@
+{
+    "deviceId": "final_success_test_001",
+    "timestamp": "2025-07-04T01:45:00Z",
+    "kwhConsumed": 0.14,
+    "currentAmp": 0.65,
+    "voltageVolt": 236.0,
+    "powerWatt": 153.0,
+    "energySource": "Grid"
+}
