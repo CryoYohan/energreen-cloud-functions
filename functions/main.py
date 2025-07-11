@@ -1,12 +1,7 @@
 import functions_framework
 import google.cloud.firestore
-# REMOVE ALL LINES THAT IMPORT Timestamp:
-# from google.cloud.firestore import Timestamp
-# from google.cloud.firestore_v1.types import Timestamp
-# from google.protobuf.timestamp_pb2 import Timestamp as ProtoTimestamp
-import datetime # Keep this import
+import datetime
 import json
-# REMOVE THIS LINE if it's still there: import os
 
 @functions_framework.http
 def receive_energy_data(request):
@@ -14,14 +9,11 @@ def receive_energy_data(request):
     HTTP Cloud Function to receive energy data from IoT devices and store it in Firestore.
     Expects a POST request with a JSON body containing energy readings.
     """
-    # Initialize Firestore client INSIDE the function
     firestore_client = google.cloud.firestore.Client()
 
-    # Ensure it's a POST request
     if request.method != 'POST':
         return ('Method Not Allowed', 405)
 
-    # Parse the JSON request body
     try:
         request_json = request.get_json(silent=True)
         if not request_json:
@@ -38,7 +30,8 @@ def receive_energy_data(request):
 
     # Extract data from the request
     device_id = request_json['deviceId']
-    timestamp_str = request_json['timestamp']
+    # 'timestamp' from ESP32 is an integer (seconds since 2000-01-01 UTC)
+    timestamp_mpy_int = request_json['timestamp']
     kwh_consumed = request_json['kwhConsumed']
     current_amp = request_json['currentAmp']
     voltage_volt = request_json['voltageVolt']
@@ -46,37 +39,48 @@ def receive_energy_data(request):
     energy_source = request_json.get('energySource', 'Grid') # Default to 'Grid' if not provided
 
     try:
-        # Convert timestamp string to datetime object
-        timestamp_dt = datetime.datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        # --- CRUCIAL TIMESTAMP CONVERSION ---
+        # MicroPython's time.time() epoch is Jan 1, 2000, 00:00:00 UTC
+        # Python's datetime.fromtimestamp() epoch is Jan 1, 1970, 00:00:00 UTC
+        # Calculate the offset in seconds between these two epochs
+        EPOCH_OFFSET_SECONDS_1970_TO_2000 = 946684800 # (30 years * 365.25 days/year * 24 hours * 60 min * 60 sec)
 
-        # THIS IS THE CRUCIAL CHANGE: Directly use the datetime object
-        # Firestore will automatically convert this to its native Timestamp type
-        firestore_timestamp_value = timestamp_dt
+        # Convert MicroPython timestamp to Unix timestamp (seconds since 1970)
+        unix_timestamp_seconds = timestamp_mpy_int + EPOCH_OFFSET_SECONDS_1970_TO_2000
 
-        # Reference to the specific device's realtime_readings subcollection
-        doc_ref = firestore_client.collection('devices').document(device_id).collection('realtime_readings').document(timestamp_str)
+        # Convert Unix timestamp to a Python datetime object (in UTC)
+        timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
+        # --- END TIMESTAMP CONVERSION ---
+
+        # Format datetime object for use as a Firestore Document ID
+        # Example format: '2025-07-04T01:45:00Z' (from your screenshot)
+        # We replace colons with hyphens as they can sometimes cause issues in document IDs depending on context
+        doc_id = timestamp_dt.isoformat(timespec='seconds').replace('+00:00', 'Z').replace(':', '-') # Ensures 'Z' for UTC and clean ID
+
+        # Reference to the specific device's realtime_readings subcollection, using formatted timestamp as ID
+        doc_ref = firestore_client.collection('devices').document(device_id).collection('realtime_readings').document(doc_id)
 
         # Prepare data for Firestore
         data_to_store = {
-            'timestamp': firestore_timestamp_value, # Pass the datetime object directly
+            'timestamp': timestamp_dt, # Store as datetime object, Firestore auto-converts to native Timestamp
             'kwhConsumed': float(kwh_consumed),
             'currentAmp': float(current_amp),
             'voltageVolt': float(voltage_volt),
             'powerWatt': float(power_watt),
-            'energySource': energy_source
+            'energySource': energy_source,
+            # Optional: store the raw MicroPython timestamp for debugging/auditing
+            'timestamp_esp32_raw': timestamp_mpy_int
         }
 
         # Store data in Firestore
         doc_ref.set(data_to_store)
 
-        print(f'Data received and stored for device: {device_id} at timestamp: {timestamp_str}')
+        print(f'Data received and stored for device: {device_id} at timestamp: {timestamp_dt.isoformat()}')
         return ('Data received successfully!', 200)
 
-    except ValueError as ve:
-        print(f'Data conversion error: {ve}')
+    except (ValueError, TypeError) as ve: # Catch type/value errors from conversion
+        print(f'Data conversion or format error: {ve}')
         return (f'Invalid data format: {ve}', 400)
     except Exception as e:
         print(f'Error writing document to Firestore: {e}')
         return (f'Error processing request and saving data: {e}', 500)
-
-# Ensure no if __name__ == '__main__': block at the end
