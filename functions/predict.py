@@ -98,9 +98,13 @@ def transform_device_data_for_prediction(raw_data, historical_df):
     # Extract date and time features from the timestamp
     timestamp = raw_data.get('timestamp')
     if timestamp is not None:
-        EPOCH_OFFSET_SECONDS_1970_TO_2000 = 946684800
-        unix_timestamp_seconds = timestamp + EPOCH_OFFSET_SECONDS_1970_TO_2000
-        dt_object = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
+        # A simple helper function to convert the timestamp
+        def to_dt_object(ts):
+            EPOCH_OFFSET_SECONDS_1970_TO_2000 = 946684800
+            unix_timestamp_seconds = ts + EPOCH_OFFSET_SECONDS_1970_TO_2000
+            return datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
+        
+        dt_object = to_dt_object(timestamp)
         
         model_features['Year'] = dt_object.year
         model_features['Month'] = dt_object.month
@@ -143,8 +147,8 @@ def transform_device_data_for_prediction(raw_data, historical_df):
         latest_data = historical_df.iloc[-1]
         
         # Calculate lag features based on the latest historical data
-        model_features['Global_active_power_lag1h'] = latest_data['powerWatt']
-        model_features['Global_active_power_lag24h'] = latest_data['powerWatt']
+        model_features['Global_active_power_lag1h'] = latest_data.get('powerWatt')
+        model_features['Global_active_power_lag24h'] = latest_data.get('powerWatt')
         
         # Calculate rolling mean
         model_features['Global_active_power_rolling_mean_24h'] = historical_df['powerWatt'].mean()
@@ -156,10 +160,17 @@ def transform_device_data_for_prediction(raw_data, historical_df):
 @functions_framework.http
 def daily_prediction_runner(request):
     """
-    HTTP Cloud Function to run daily predictions.
-    This function would be triggered by Cloud Scheduler.
+    HTTP Cloud Function to run a prediction for a single device.
+    It expects a JSON payload with a 'deviceId' key.
     """
     try:
+        request_json = request.get_json(silent=True)
+        if not request_json or 'deviceId' not in request_json:
+            return ('Missing "deviceId" in request body.', 400)
+            
+        device_id = request_json['deviceId']
+        print(f"Starting prediction for device: {device_id}")
+
         # 1. Download the retrained model from Google Cloud Storage
         bucket = storage_client.bucket(MODEL_BUCKET_NAME)
         blob = bucket.blob(MODEL_FILE_NAME)
@@ -172,55 +183,43 @@ def daily_prediction_runner(request):
         model = lgb.Booster(model_file=temp_model_path)
         print("Model loaded successfully from GCS.")
 
-        # 2. Get a list of all devices to run predictions for
-        # This assumes your devices are documents in the 'devices' collection
-        device_ids = [doc.id for doc in firestore_client.collection('devices').stream()]
+        # 2. Get historical data for the last 24 hours (for lagged features)
+        historical_data = get_historical_data(device_id, days=1)
+        
+        # Check if we have enough data to predict
+        if historical_data.empty:
+            print(f"Not enough historical data for device {device_id}. Skipping prediction.")
+            return (f"Not enough historical data for device {device_id}. Prediction skipped.", 200)
 
-        for device_id in device_ids:
-            print(f"Starting prediction for device: {device_id}")
+        # 3. Get the latest data point to use for prediction
+        raw_data_for_prediction = historical_data.iloc[-1].to_dict()
+        raw_data_for_prediction['timestamp'] = raw_data_for_prediction['timestamp'].timestamp()
+        
+        # 4. Transform the data into the format the model expects
+        features_df = transform_device_data_for_prediction(raw_data_for_prediction, historical_data)
 
-            # 3. Get historical data for the last 24 hours (for lagged features)
-            historical_data = get_historical_data(device_id, days=1)
-            
-            # Check if we have enough data to predict
-            if historical_data.empty:
-                print(f"Not enough historical data for device {device_id}. Skipping prediction.")
-                continue
+        # Ensure the feature order matches the model's training order
+        features_df = features_df[model.feature_name()]
 
-            # 4. Get the latest data point to use for prediction
-            # The 'raw_data' here is the latest reading from the Firestore collection
-            raw_data_for_prediction = historical_data.iloc[-1].to_dict()
-            raw_data_for_prediction['timestamp'] = raw_data_for_prediction['timestamp'].timestamp()
-            
-            # 5. Transform the data into the format the model expects
-            # This is where your transform logic is used
-            features_df = transform_device_data_for_prediction(raw_data_for_prediction, historical_data)
+        # 5. Make the prediction
+        prediction = model.predict(features_df)
+        
+        # 6. Store the prediction result in a new Firestore document
+        prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predictions').document(
+            datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+        )
+        
+        prediction_data = {
+            'prediction_value': float(prediction[0]), # Convert to standard Python float
+            'timestamp': datetime.datetime.now(tz=datetime.timezone.utc),
+            'prediction_date': datetime.datetime.now(tz=datetime.timezone.utc).date().isoformat()
+        }
+        prediction_doc_ref.set(prediction_data)
 
-            # Ensure the feature order matches the model's training order
-            # The model's feature_names attribute holds this order.
-            # This is a critical step!
-            features_df = features_df[model.feature_name()]
+        print(f"Prediction for device {device_id} successful. Result: {prediction_data}")
 
-            # 6. Make the prediction
-            prediction = model.predict(features_df)
-            
-            # 7. Store the prediction result in a new Firestore document
-            prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predictions').document(
-                datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
-            )
-            
-            prediction_data = {
-                'prediction_value': float(prediction[0]), # Convert to standard Python float
-                'timestamp': datetime.datetime.now(tz=datetime.timezone.utc),
-                'prediction_date': datetime.datetime.now(tz=datetime.timezone.utc).date().isoformat()
-            }
-            prediction_doc_ref.set(prediction_data)
-
-            print(f"Prediction for device {device_id} successful. Result: {prediction_data}")
-
-        return ('Daily prediction job completed successfully for all devices.', 200)
+        return (f'Prediction job completed successfully for device: {device_id}', 200)
 
     except Exception as e:
         print(f"An error occurred: {e}")
         return (f"Prediction failed with an error: {e}", 500)
-
