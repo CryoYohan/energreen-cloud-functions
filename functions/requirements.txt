@@ -1,5 +1,5 @@
 functions-framework==3.5.0
 google-cloud-firestore==2.11.1
 pandas
-lightbgm
+lightgbm
 google-cloud-storage

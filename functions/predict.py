@@ -8,10 +8,12 @@ import math
 import os
 
 # Define the bucket and model file location
+# This is a good practice to define at the top
 MODEL_BUCKET_NAME = 'energreen-prediction-model'
 MODEL_FILE_NAME = 'energreen-prediction-model/lightgbm_power_prediction_model_energreen_v2.joblib'
 
 # Initialize Firestore and GCS clients
+# Initialize clients in the global scope for better performance
 firestore_client = google.cloud.firestore.Client()
 storage_client = storage.Client()
 
