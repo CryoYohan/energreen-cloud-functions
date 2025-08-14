@@ -202,13 +202,23 @@ def daily_prediction_runner(request):
         # 5. Transform the data into the format the model expects
         features_df = transform_device_data_for_prediction(raw_data_for_prediction, historical_data)
 
+        # --- FIX FOR OBJECT DTYPE ERROR ---
+        # Fill any None or NaN values in the reactive power column to ensure it's a numeric type
+        features_df['Global_reactive_power'] = features_df['Global_reactive_power'].fillna(0).astype(float)
+
         # Define the expected feature order for the model
+        # NOTE: The 'Global_active_power' target variable is intentionally excluded here
         model_feature_names = [
             'Year', 'Month', 'Day', 'Hour', 'DayOfWeek', 'DayOfYear', 'WeekOfYear', 
-            'Quarter', 'IsWeekend', 'Season', 'Global_active_power', 'Global_reactive_power',
+            'Quarter', 'IsWeekend', 'Season', 'Global_reactive_power',
             'Voltage', 'Global_intensity', 'Global_active_power_lag1h',
             'Global_active_power_lag24h', 'Global_active_power_rolling_mean_24h'
         ]
+
+        # --- FIX FOR CATEGORICAL FEATURE ERROR ---
+        # Convert the 'Season' column to the 'category' dtype with the same categories used in training.
+        # This is critical for LightGBM to correctly process the feature.
+        features_df['Season'] = features_df['Season'].astype('category')
         
         # Ensure the feature order matches the model's training order
         features_df = features_df[model_feature_names]
