@@ -2,13 +2,13 @@ import functions_framework
 import google.cloud.firestore
 import datetime
 import pandas as pd
-import lightgbm as lgb
+# import lightgbm as lgb
+import joblib # Import the joblib library
 from google.cloud import storage
 import math
 import os
 
 # Define the bucket and model file location
-# This is a good practice to define at the top
 MODEL_BUCKET_NAME = 'energreen-prediction-model'
 MODEL_FILE_NAME = 'lightgbm_power_prediction_model_energreen_v2.joblib'
 
@@ -178,14 +178,15 @@ def daily_prediction_runner(request):
         blob = bucket.blob(MODEL_FILE_NAME)
         
         # Create a temporary file to save the model
-        temp_model_path = '/tmp/model.txt'
+        temp_model_path = '/tmp/model.joblib'
         blob.download_to_filename(temp_model_path)
         
-        # Load the LightGBM model
-        model = lgb.Booster(model_file=temp_model_path)
+        # 2. Load the model using joblib
+        # This is the corrected line to handle the .joblib file format
+        model = joblib.load(temp_model_path)
         print("Model loaded successfully from GCS.")
-
-        # 2. Get historical data for the last 24 hours (for lagged features)
+        
+        # 3. Get historical data for the last 24 hours (for lagged features)
         historical_data = get_historical_data(device_id, days=1)
         
         # Check if we have enough data to predict
@@ -193,20 +194,20 @@ def daily_prediction_runner(request):
             print(f"Not enough historical data for device {device_id}. Skipping prediction.")
             return (f"Not enough historical data for device {device_id}. Prediction skipped.", 200)
 
-        # 3. Get the latest data point to use for prediction
+        # 4. Get the latest data point to use for prediction
         raw_data_for_prediction = historical_data.iloc[-1].to_dict()
         raw_data_for_prediction['timestamp'] = raw_data_for_prediction['timestamp'].timestamp()
         
-        # 4. Transform the data into the format the model expects
+        # 5. Transform the data into the format the model expects
         features_df = transform_device_data_for_prediction(raw_data_for_prediction, historical_data)
 
         # Ensure the feature order matches the model's training order
         features_df = features_df[model.feature_name()]
 
-        # 5. Make the prediction
+        # 6. Make the prediction
         prediction = model.predict(features_df)
         
-        # 6. Store the prediction result in a new Firestore document
+        # 7. Store the prediction result in a new Firestore document
         prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predictions').document(
             datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
         )
