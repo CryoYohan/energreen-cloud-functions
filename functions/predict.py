@@ -8,8 +8,8 @@ import math
 import os
 
 # Define the bucket and model file location
-MODEL_BUCKET_NAME = 'your-gcs-bucket-name'
-MODEL_FILE_NAME = 'your_retrained_model.txt'
+MODEL_BUCKET_NAME = 'energreen-prediction-model'
+MODEL_FILE_NAME = 'energreen-prediction-model/lightgbm_power_prediction_model_energreen_v2.joblib'
 
 # Initialize Firestore and GCS clients
 firestore_client = google.cloud.firestore.Client()
