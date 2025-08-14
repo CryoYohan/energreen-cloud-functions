@@ -182,7 +182,6 @@ def daily_prediction_runner(request):
         blob.download_to_filename(temp_model_path)
         
         # 2. Load the model using joblib
-        # This is the corrected line to handle the .joblib file format
         model = joblib.load(temp_model_path)
         print("Model loaded successfully from GCS.")
         
@@ -195,14 +194,24 @@ def daily_prediction_runner(request):
             return (f"Not enough historical data for device {device_id}. Prediction skipped.", 200)
 
         # 4. Get the latest data point to use for prediction
-        raw_data_for_prediction = historical_data.iloc[-1].to_dict()
-        raw_data_for_prediction['timestamp'] = raw_data_for_prediction['timestamp'].timestamp()
+        latest_row_series = historical_data.iloc[-1]
+        raw_data_for_prediction = latest_row_series.to_dict()
+        # Correctly get the timestamp from the DataFrame's index
+        raw_data_for_prediction['timestamp'] = historical_data.index[-1].timestamp()
         
         # 5. Transform the data into the format the model expects
         features_df = transform_device_data_for_prediction(raw_data_for_prediction, historical_data)
 
+        # Define the expected feature order for the model
+        model_feature_names = [
+            'Year', 'Month', 'Day', 'Hour', 'DayOfWeek', 'DayOfYear', 'WeekOfYear', 
+            'Quarter', 'IsWeekend', 'Season', 'Global_active_power', 'Global_reactive_power',
+            'Voltage', 'Global_intensity', 'Global_active_power_lag1h',
+            'Global_active_power_lag24h', 'Global_active_power_rolling_mean_24h'
+        ]
+        
         # Ensure the feature order matches the model's training order
-        features_df = features_df[model.feature_name()]
+        features_df = features_df[model_feature_names]
 
         # 6. Make the prediction
         prediction = model.predict(features_df)
