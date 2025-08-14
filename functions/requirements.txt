@@ -3,3 +3,4 @@ google-cloud-firestore==2.11.1
 pandas
 lightgbm
 google-cloud-storage
+joblib
