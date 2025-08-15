@@ -57,26 +57,21 @@ def get_historical_data(device_id, days=2):
 def create_prediction_features(historical_df, target_datetime):
     """
     Creates the necessary features (lagged values, rolling mean, etc.) for a
-    given target datetime based on the historical data.
+    given target datetime based on the historical data. This version is more
+    resilient and only creates features that have enough historical data.
 
     Args:
         historical_df (pd.DataFrame): DataFrame with historical data.
         target_datetime (datetime.datetime): The specific future datetime to predict for.
 
     Returns:
-        pd.DataFrame or None: A DataFrame with the features, or None if there's
-                              not enough historical data to create them.
+        dict: A dictionary of the features, or None if there's no data at all.
     """
     # Get the historical data *before* the target datetime
     data_for_lags = historical_df[historical_df.index < target_datetime]
     
-    # Check if there is enough data for the lag features
-    timestamp_24h_ago = target_datetime - datetime.timedelta(hours=24)
-    lag_24h_data = historical_df[historical_df.index <= timestamp_24h_ago]
-
-    # If there's not enough data for the 24h lag, we can't make this prediction
-    if lag_24h_data.empty:
-        print(f"Skipping prediction for {target_datetime}. Not enough historical data for 24h lag.")
+    if data_for_lags.empty:
+        print(f"Skipping feature creation for {target_datetime}. No historical data available.")
         return None
 
     model_features = {}
@@ -99,26 +94,40 @@ def create_prediction_features(historical_df, target_datetime):
     else: model_features['Season'] = 4
     
     # --- Historical Features (Lags & Rolling Mean) ---
+    # Use latest available readings for real-time features
     latest_data = data_for_lags.iloc[-1]
+    model_features['Voltage'] = latest_data['voltageVolt']
+    model_features['Global_intensity'] = latest_data['currentAmp']
     
-    # Calculate lag features
+    # Calculate Global_active_power_lag1h if possible
     timestamp_1h_ago = target_datetime - datetime.timedelta(hours=1)
     lag_1h_data = historical_df[historical_df.index <= timestamp_1h_ago]
-    model_features['Global_active_power_lag1h'] = lag_1h_data.iloc[-1]['powerWatt']
+    if not lag_1h_data.empty:
+        model_features['Global_active_power_lag1h'] = lag_1h_data.iloc[-1]['powerWatt']
+    else:
+        # Default value if not enough data
+        model_features['Global_active_power_lag1h'] = 0.0
 
-    model_features['Global_active_power_lag24h'] = lag_24h_data.iloc[-1]['powerWatt']
-
-    # Calculate rolling mean for the 24 hours leading up to the target
+    # Calculate Global_active_power_lag24h if possible
+    timestamp_24h_ago = target_datetime - datetime.timedelta(hours=24)
+    lag_24h_data = historical_df[historical_df.index <= timestamp_24h_ago]
+    if not lag_24h_data.empty:
+        model_features['Global_active_power_lag24h'] = lag_24h_data.iloc[-1]['powerWatt']
+    else:
+        # Default value if not enough data
+        model_features['Global_active_power_lag24h'] = 0.0
+        
+    # Calculate rolling mean for the 24 hours if possible
     rolling_mean_data = historical_df[
         (historical_df.index >= target_datetime - datetime.timedelta(hours=24)) &
         (historical_df.index < target_datetime)
     ]['powerWatt']
-    model_features['Global_active_power_rolling_mean_24h'] = rolling_mean_data.mean()
+    if not rolling_mean_data.empty:
+        model_features['Global_active_power_rolling_mean_24h'] = rolling_mean_data.mean()
+    else:
+        # Default value if not enough data
+        model_features['Global_active_power_rolling_mean_24h'] = 0.0
         
-    # Use latest available readings for real-time features
-    model_features['Voltage'] = latest_data['voltageVolt']
-    model_features['Global_intensity'] = latest_data['currentAmp']
-    
     # Reactive power calculation based on latest data
     power_factor = latest_data['powerFactor']
     power_watt = latest_data['powerWatt']
@@ -182,8 +191,7 @@ def daily_prediction_runner(request):
         # 3. Define the target datetimes for our multi-interval predictions
         current_time = datetime.datetime.now(tz=datetime.timezone.utc)
         predictions_to_store = []
-        has_predictions = False
-
+        
         # --- Prediction for next data point (e.g., next minute) ---
         target_time_immediate = current_time + datetime.timedelta(minutes=1)
         features_immediate = create_prediction_features(historical_data, target_time_immediate)
@@ -194,7 +202,6 @@ def daily_prediction_runner(request):
                 'prediction_for_time': target_time_immediate,
                 'interval': 'Immediate'
             })
-            has_predictions = True
         
         # --- Prediction for one hour from now ---
         target_time_next_hour = current_time + datetime.timedelta(hours=1)
@@ -206,7 +213,6 @@ def daily_prediction_runner(request):
                 'prediction_for_time': target_time_next_hour,
                 'interval': 'Next Hour'
             })
-            has_predictions = True
 
         # --- Prediction for the same time tomorrow ---
         target_time_next_day = current_time + datetime.timedelta(days=1)
@@ -218,9 +224,8 @@ def daily_prediction_runner(request):
                 'prediction_for_time': target_time_next_day,
                 'interval': 'Next Day'
             })
-            has_predictions = True
 
-        if not has_predictions:
+        if not predictions_to_store:
             print(f"Not enough historical data for any prediction for device {device_id}. Skipping.")
             return (f"Not enough historical data for any prediction for device {device_id}. Prediction skipped.", 200)
 
