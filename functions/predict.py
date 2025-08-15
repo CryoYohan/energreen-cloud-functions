@@ -2,8 +2,7 @@ import functions_framework
 import google.cloud.firestore
 import datetime
 import pandas as pd
-# import lightgbm as lgb
-import joblib # Import the joblib library
+import joblib
 from google.cloud import storage
 import math
 import os
@@ -17,14 +16,14 @@ MODEL_FILE_NAME = 'lightgbm_power_prediction_model_energreen_v2.joblib'
 firestore_client = google.cloud.firestore.Client()
 storage_client = storage.Client()
 
-
-def get_historical_data(device_id, days=1):
+def get_historical_data(device_id, days=2):
     """
     Fetches historical data from Firestore for a specific device.
 
     Args:
         device_id (str): The ID of the device.
         days (int): The number of days of historical data to fetch.
+                    We fetch 2 days to ensure we have enough data for 24h lags.
 
     Returns:
         pd.DataFrame: A DataFrame containing the historical data.
@@ -32,12 +31,7 @@ def get_historical_data(device_id, days=1):
     end_time = datetime.datetime.now(tz=datetime.timezone.utc)
     start_time = end_time - datetime.timedelta(days=days)
 
-    # Reference to the realtime_readings collection for the device
     collection_ref = firestore_client.collection('devices').document(device_id).collection('realtime_readings')
-
-    # Query the data within the specified time range
-    # Note: Firestore queries are limited to what can be indexed.
-    # The 'timestamp' field is a Timestamp object, which is perfect for this.
     query = collection_ref.where('timestamp', '>=', start_time).where('timestamp', '<', end_time).order_by('timestamp')
 
     docs = query.stream()
@@ -45,92 +39,89 @@ def get_historical_data(device_id, days=1):
     for doc in docs:
         doc_data = doc.to_dict()
         data.append({
-            'timestamp': doc_data.get('timestamp').isoformat(),
+            'timestamp': doc_data.get('timestamp'),
             'powerWatt': doc_data.get('powerWatt'),
             'voltageVolt': doc_data.get('voltageVolt'),
             'currentAmp': doc_data.get('currentAmp'),
             'powerFactor': doc_data.get('powerFactor'),
         })
     
-    # Convert to pandas DataFrame for easier manipulation
     df = pd.DataFrame(data)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df = df.set_index('timestamp').sort_index()
+    if not df.empty:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+        df = df.set_index('timestamp').sort_index()
 
     return df
 
 
-def calculate_lags_and_rolling_means(df):
+def create_prediction_features(historical_df, target_datetime):
     """
-    Calculates lagged and rolling mean features for the DataFrame.
+    Creates the necessary features (lagged values, rolling mean, etc.) for a
+    given target datetime based on the historical data.
 
     Args:
-        df (pd.DataFrame): DataFrame with a 'powerWatt' column and a datetime index.
+        historical_df (pd.DataFrame): DataFrame with historical data.
+        target_datetime (datetime.datetime): The specific future datetime to predict for.
 
     Returns:
-        pd.DataFrame: The DataFrame with the new features added.
+        pd.DataFrame or None: A DataFrame with the features, or None if there's
+                              not enough historical data to create them.
     """
-    # Assuming data is at a regular interval (e.g., 1 minute)
-    # Lag 1h (60 minutes)
-    df['Global_active_power_lag1h'] = df['powerWatt'].shift(60) 
+    # Get the historical data *before* the target datetime
+    data_for_lags = historical_df[historical_df.index < target_datetime]
     
-    # Lag 24h (1440 minutes)
-    df['Global_active_power_lag24h'] = df['powerWatt'].shift(1440) 
-    
-    # Rolling mean 24h (1440 minutes)
-    df['Global_active_power_rolling_mean_24h'] = df['powerWatt'].rolling(window=1440).mean()
+    # Check if there is enough data for the lag features
+    timestamp_24h_ago = target_datetime - datetime.timedelta(hours=24)
+    lag_24h_data = historical_df[historical_df.index <= timestamp_24h_ago]
 
-    return df
+    # If there's not enough data for the 24h lag, we can't make this prediction
+    if lag_24h_data.empty:
+        print(f"Skipping prediction for {target_datetime}. Not enough historical data for 24h lag.")
+        return None
 
-
-def transform_device_data_for_prediction(raw_data, historical_df):
-    """
-    Transforms raw device data, including historical features, for the model.
-    This is a modified version of your original function.
-
-    Args:
-        raw_data (dict): A dictionary containing the raw data.
-        historical_df (pd.DataFrame): DataFrame with historical data to calculate features.
-
-    Returns:
-        pd.DataFrame: A DataFrame with the correct feature names and calculated values.
-    """
     model_features = {}
     
-    # Extract date and time features from the timestamp
-    timestamp = raw_data.get('timestamp')
-    if timestamp is not None:
-        # A simple helper function to convert the timestamp
-        def to_dt_object(ts):
-            EPOCH_OFFSET_SECONDS_1970_TO_2000 = 946684800
-            unix_timestamp_seconds = ts + EPOCH_OFFSET_SECONDS_1970_TO_2000
-            return datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
-        
-        dt_object = to_dt_object(timestamp)
-        
-        model_features['Year'] = dt_object.year
-        model_features['Month'] = dt_object.month
-        model_features['Day'] = dt_object.day
-        model_features['Hour'] = dt_object.hour
-        model_features['DayOfWeek'] = dt_object.weekday()
-        model_features['DayOfYear'] = dt_object.timetuple().tm_yday
-        model_features['WeekOfYear'] = dt_object.isocalendar()[1]
-        model_features['Quarter'] = (dt_object.month - 1) // 3 + 1
-        model_features['IsWeekend'] = 1 if dt_object.weekday() >= 5 else 0
-        
-        month = dt_object.month
-        if month in [12, 1, 2]: model_features['Season'] = 1
-        elif month in [3, 4, 5]: model_features['Season'] = 2
-        elif month in [6, 7, 8]: model_features['Season'] = 3
-        else: model_features['Season'] = 4
+    # --- Date and Time Features ---
+    model_features['Year'] = target_datetime.year
+    model_features['Month'] = target_datetime.month
+    model_features['Day'] = target_datetime.day
+    model_features['Hour'] = target_datetime.hour
+    model_features['DayOfWeek'] = target_datetime.weekday()
+    model_features['DayOfYear'] = target_datetime.timetuple().tm_yday
+    model_features['WeekOfYear'] = target_datetime.isocalendar()[1]
+    model_features['Quarter'] = (target_datetime.month - 1) // 3 + 1
+    model_features['IsWeekend'] = 1 if target_datetime.weekday() >= 5 else 0
     
-    # Direct mapping and calculation of other features
-    model_features['Global_active_power'] = raw_data.get('powerWatt')
-    model_features['Voltage'] = raw_data.get('voltageVolt')
-    model_features['Global_intensity'] = raw_data.get('currentAmp')
+    month = target_datetime.month
+    if month in [12, 1, 2]: model_features['Season'] = 1
+    elif month in [3, 4, 5]: model_features['Season'] = 2
+    elif month in [6, 7, 8]: model_features['Season'] = 3
+    else: model_features['Season'] = 4
     
-    power_factor = raw_data.get('powerFactor')
-    power_watt = raw_data.get('powerWatt')
+    # --- Historical Features (Lags & Rolling Mean) ---
+    latest_data = data_for_lags.iloc[-1]
+    
+    # Calculate lag features
+    timestamp_1h_ago = target_datetime - datetime.timedelta(hours=1)
+    lag_1h_data = historical_df[historical_df.index <= timestamp_1h_ago]
+    model_features['Global_active_power_lag1h'] = lag_1h_data.iloc[-1]['powerWatt']
+
+    model_features['Global_active_power_lag24h'] = lag_24h_data.iloc[-1]['powerWatt']
+
+    # Calculate rolling mean for the 24 hours leading up to the target
+    rolling_mean_data = historical_df[
+        (historical_df.index >= target_datetime - datetime.timedelta(hours=24)) &
+        (historical_df.index < target_datetime)
+    ]['powerWatt']
+    model_features['Global_active_power_rolling_mean_24h'] = rolling_mean_data.mean()
+        
+    # Use latest available readings for real-time features
+    model_features['Voltage'] = latest_data['voltageVolt']
+    model_features['Global_intensity'] = latest_data['currentAmp']
+    
+    # Reactive power calculation based on latest data
+    power_factor = latest_data['powerFactor']
+    power_watt = latest_data['powerWatt']
     if power_factor is not None and power_watt is not None and power_factor != 0:
         try:
             pf_clamped = max(-1.0, min(1.0, power_factor))
@@ -138,31 +129,31 @@ def transform_device_data_for_prediction(raw_data, historical_df):
             reactive_power = power_watt * math.tan(angle)
             model_features['Global_reactive_power'] = reactive_power
         except ValueError:
-            print("Error calculating reactive power.")
             model_features['Global_reactive_power'] = None
     else:
         model_features['Global_reactive_power'] = None
-    
-    # Now, add the features that require historical data from the DataFrame
-    if not historical_df.empty:
-        # Get the latest data point from the historical DataFrame
-        latest_data = historical_df.iloc[-1]
-        
-        # Calculate lag features based on the latest historical data
-        model_features['Global_active_power_lag1h'] = latest_data.get('powerWatt')
-        model_features['Global_active_power_lag24h'] = latest_data.get('powerWatt')
-        
-        # Calculate rolling mean
-        model_features['Global_active_power_rolling_mean_24h'] = historical_df['powerWatt'].mean()
 
-    # Create a DataFrame from the single transformed data point
-    return pd.DataFrame([model_features])
+    features_df = pd.DataFrame([model_features])
+    
+    # Ensure correct data types and feature order
+    features_df['Global_reactive_power'] = features_df['Global_reactive_power'].fillna(0).astype(float)
+    features_df['Season'] = features_df['Season'].astype('category')
+    
+    # Define the expected feature order for the model
+    model_feature_names = [
+        'Year', 'Month', 'Day', 'Hour', 'DayOfWeek', 'DayOfYear', 'WeekOfYear', 
+        'Quarter', 'IsWeekend', 'Season', 'Global_reactive_power',
+        'Voltage', 'Global_intensity', 'Global_active_power_lag1h',
+        'Global_active_power_lag24h', 'Global_active_power_rolling_mean_24h'
+    ]
+    
+    return features_df[model_feature_names]
 
 
 @functions_framework.http
 def daily_prediction_runner(request):
     """
-    HTTP Cloud Function to run a prediction for a single device.
+    HTTP Cloud Function to run a multi-interval prediction for a single device.
     It expects a JSON payload with a 'deviceId' key.
     """
     try:
@@ -171,76 +162,80 @@ def daily_prediction_runner(request):
             return ('Missing "deviceId" in request body.', 400)
             
         device_id = request_json['deviceId']
-        print(f"Starting prediction for device: {device_id}")
+        print(f"Starting multi-interval prediction for device: {device_id}")
 
-        # 1. Download the retrained model from Google Cloud Storage
+        # 1. Download and load the retrained model
         bucket = storage_client.bucket(MODEL_BUCKET_NAME)
         blob = bucket.blob(MODEL_FILE_NAME)
-        
-        # Create a temporary file to save the model
         temp_model_path = '/tmp/model.joblib'
         blob.download_to_filename(temp_model_path)
-        
-        # 2. Load the model using joblib
         model = joblib.load(temp_model_path)
         print("Model loaded successfully from GCS.")
         
-        # 3. Get historical data for the last 24 hours (for lagged features)
-        historical_data = get_historical_data(device_id, days=1)
+        # 2. Get historical data for the last 48 hours to ensure we have enough data
+        historical_data = get_historical_data(device_id, days=2)
         
-        # Check if we have enough data to predict
         if historical_data.empty:
-            print(f"Not enough historical data for device {device_id}. Skipping prediction.")
-            return (f"Not enough historical data for device {device_id}. Prediction skipped.", 200)
+            print(f"No historical data found for device {device_id}. Skipping all predictions.")
+            return (f"No historical data found for device {device_id}. Prediction skipped.", 200)
 
-        # 4. Get the latest data point to use for prediction
-        latest_row_series = historical_data.iloc[-1]
-        raw_data_for_prediction = latest_row_series.to_dict()
-        # Correctly get the timestamp from the DataFrame's index
-        raw_data_for_prediction['timestamp'] = historical_data.index[-1].timestamp()
+        # 3. Define the target datetimes for our multi-interval predictions
+        current_time = datetime.datetime.now(tz=datetime.timezone.utc)
+        predictions_to_store = []
+        has_predictions = False
+
+        # --- Prediction for next data point (e.g., next minute) ---
+        target_time_immediate = current_time + datetime.timedelta(minutes=1)
+        features_immediate = create_prediction_features(historical_data, target_time_immediate)
+        if features_immediate is not None:
+            prediction_immediate = model.predict(features_immediate)[0]
+            predictions_to_store.append({
+                'prediction_value': float(prediction_immediate),
+                'prediction_for_time': target_time_immediate,
+                'interval': 'Immediate'
+            })
+            has_predictions = True
         
-        # 5. Transform the data into the format the model expects
-        features_df = transform_device_data_for_prediction(raw_data_for_prediction, historical_data)
+        # --- Prediction for one hour from now ---
+        target_time_next_hour = current_time + datetime.timedelta(hours=1)
+        features_next_hour = create_prediction_features(historical_data, target_time_next_hour)
+        if features_next_hour is not None:
+            prediction_next_hour = model.predict(features_next_hour)[0]
+            predictions_to_store.append({
+                'prediction_value': float(prediction_next_hour),
+                'prediction_for_time': target_time_next_hour,
+                'interval': 'Next Hour'
+            })
+            has_predictions = True
 
-        # --- FIX FOR OBJECT DTYPE ERROR ---
-        # Fill any None or NaN values in the reactive power column to ensure it's a numeric type
-        features_df['Global_reactive_power'] = features_df['Global_reactive_power'].fillna(0).astype(float)
+        # --- Prediction for the same time tomorrow ---
+        target_time_next_day = current_time + datetime.timedelta(days=1)
+        features_next_day = create_prediction_features(historical_data, target_time_next_day)
+        if features_next_day is not None:
+            prediction_next_day = model.predict(features_next_day)[0]
+            predictions_to_store.append({
+                'prediction_value': float(prediction_next_day),
+                'prediction_for_time': target_time_next_day,
+                'interval': 'Next Day'
+            })
+            has_predictions = True
 
-        # Define the expected feature order for the model
-        # NOTE: The 'Global_active_power' target variable is intentionally excluded here
-        model_feature_names = [
-            'Year', 'Month', 'Day', 'Hour', 'DayOfWeek', 'DayOfYear', 'WeekOfYear', 
-            'Quarter', 'IsWeekend', 'Season', 'Global_reactive_power',
-            'Voltage', 'Global_intensity', 'Global_active_power_lag1h',
-            'Global_active_power_lag24h', 'Global_active_power_rolling_mean_24h'
-        ]
+        if not has_predictions:
+            print(f"Not enough historical data for any prediction for device {device_id}. Skipping.")
+            return (f"Not enough historical data for any prediction for device {device_id}. Prediction skipped.", 200)
 
-        # --- FIX FOR CATEGORICAL FEATURE ERROR ---
-        # Convert the 'Season' column to the 'category' dtype with the same categories used in training.
-        # This is critical for LightGBM to correctly process the feature.
-        features_df['Season'] = features_df['Season'].astype('category')
-        
-        # Ensure the feature order matches the model's training order
-        features_df = features_df[model_feature_names]
-
-        # 6. Make the prediction
-        prediction = model.predict(features_df)
-        
-        # 7. Store the prediction result in a new Firestore document
-        prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predictions').document(
-            datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
-        )
+        # 4. Store all predictions in a single Firestore document
+        predictions_batch_doc_ref = firestore_client.collection('devices').document(device_id).collection('predictions').document()
         
         prediction_data = {
-            'prediction_value': float(prediction[0]), # Convert to standard Python float
-            'timestamp': datetime.datetime.now(tz=datetime.timezone.utc),
-            'prediction_date': datetime.datetime.now(tz=datetime.timezone.utc).date().isoformat()
+            'timestamp': current_time,
+            'predictions': predictions_to_store
         }
-        prediction_doc_ref.set(prediction_data)
+        predictions_batch_doc_ref.set(prediction_data)
 
-        print(f"Prediction for device {device_id} successful. Result: {prediction_data}")
+        print(f"Multi-interval prediction for device {device_id} successful. Results stored in Firestore.")
 
-        return (f'Prediction job completed successfully for device: {device_id}', 200)
+        return (f'Multi-interval prediction job completed successfully for device: {device_id}', 200)
 
     except Exception as e:
         print(f"An error occurred: {e}")
