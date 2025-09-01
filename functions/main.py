@@ -93,7 +93,7 @@ def receive_energy_data(request):
                 'predictedAppliance': predicted_appliance,
                 'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
             }
-            prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predictions').document(doc_id)
+            prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predicted_appliances').document(doc_id)
             prediction_doc_ref.set(prediction_data)
             print(f'Prediction stored for device: {device_id}. Predicted appliance: {predicted_appliance}')
 
