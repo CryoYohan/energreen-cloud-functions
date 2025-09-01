@@ -4,6 +4,32 @@ import datetime
 import json
 import math
 
+def predict_appliance_type(signature_data):
+    """
+    A simple rule-based model to predict appliance type based on average power consumption.
+    This can be replaced with a more advanced ML model later.
+    """
+    if not signature_data:
+        return 'Unknown'
+    
+    # Calculate the average power consumption for the signature
+    total_power = sum(float(d.get('powerWatt', 0)) for d in signature_data)
+    average_power = total_power / len(signature_data)
+    
+    # Simple prediction rules
+    if average_power > 1500:
+        return 'Oven'
+    elif average_power > 1000:
+        return 'Electric Kettle'
+    elif average_power > 500:
+        return 'Microwave'
+    elif average_power > 100:
+        return 'Toaster'
+    elif average_power > 50:
+        return 'Lightbulb'
+    else:
+        return 'Standby Power'
+
 @functions_framework.http
 def receive_energy_data(request):
     """
@@ -48,6 +74,7 @@ def receive_energy_data(request):
             
             doc_id = timestamp_dt.isoformat(timespec='seconds').replace('+00:00', 'Z').replace(':', '-')
 
+            # 1. Store the raw signature data
             data_to_store = {
                 'deviceId': device_id,
                 'timestamp': timestamp_dt,
@@ -57,6 +84,18 @@ def receive_energy_data(request):
             doc_ref = firestore_client.collection('devices').document(device_id).collection('appliance_signatures').document(doc_id)
             doc_ref.set(data_to_store)
             print(f'Appliance signature stored for device: {device_id} at timestamp: {timestamp_dt.isoformat()}')
+
+            # 2. Predict the appliance type and store it separately
+            predicted_appliance = predict_appliance_type(request_json['signature_data'])
+            prediction_data = {
+                'deviceId': device_id,
+                'timestamp': timestamp_dt,
+                'predictedAppliance': predicted_appliance,
+                'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
+            }
+            prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predictions').document(doc_id)
+            prediction_doc_ref.set(prediction_data)
+            print(f'Prediction stored for device: {device_id}. Predicted appliance: {predicted_appliance}')
 
         elif data_type == 'RegularReading':
             # Handle regular reading data
