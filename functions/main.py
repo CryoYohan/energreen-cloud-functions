@@ -22,83 +22,77 @@ def receive_energy_data(request):
     except Exception as e:
         return (f'Error parsing JSON: {e}', 400)
 
-    # Basic validation for incoming data fields
-    required_fields = ['deviceId', 'timestamp', 'kwhConsumed', 'currentAmp', 'voltageVolt', 'powerWatt', 'dataType']
-    for field in required_fields:
-        if field not in request_json:
-            print(f'Missing required field: {field} in request body: {request_json}')
-            return (f'Missing required data field: {field}.', 400)
+    # Validate that 'dataType' and 'deviceId' are always present
+    if 'dataType' not in request_json or 'deviceId' not in request_json:
+        return ('Missing required data fields: dataType or deviceId.', 400)
 
-    # Extract data from the request
-    device_id = request_json['deviceId']
-    timestamp_mpy_int = request_json['timestamp']
-    kwh_consumed = request_json['kwhConsumed']
-    current_amp = request_json['currentAmp']
-    voltage_volt = request_json['voltageVolt']
-    power_watt = request_json['powerWatt']
-    energy_source = request_json.get('energySource', 'Grid')
     data_type = request_json['dataType']
+    device_id = request_json['deviceId']
 
     try:
         # --- CRUCIAL TIMESTAMP CONVERSION ---
         # MicroPython's time.time() epoch is Jan 1, 2000, 00:00:00 UTC
         # Python's datetime.fromtimestamp() epoch is Jan 1, 1970, 00:00:00 UTC
         EPOCH_OFFSET_SECONDS_1970_TO_2000 = 946684800
-        unix_timestamp_seconds = timestamp_mpy_int + EPOCH_OFFSET_SECONDS_1970_TO_2000
-        timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
-        # --- END TIMESTAMP CONVERSION ---
+        
+        # Determine the target collection based on the data type
+        if data_type == 'ApplianceSignature':
+            # Handle signature data
+            if 'signature_data' not in request_json:
+                return ('Missing required data field: signature_data for ApplianceSignature type.', 400)
 
-        doc_id = timestamp_dt.isoformat(timespec='seconds').replace('+00:00', 'Z').replace(':', '-')
+            # Use the timestamp from the first reading in the signature for the doc ID
+            first_reading_timestamp_mpy = request_json['signature_data'][0]['timestamp']
+            unix_timestamp_seconds = first_reading_timestamp_mpy + EPOCH_OFFSET_SECONDS_1970_TO_2000
+            timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
+            
+            doc_id = timestamp_dt.isoformat(timespec='seconds').replace('+00:00', 'Z').replace(':', '-')
 
-        if data_type == 'ApplianceEvent':
-            # --- Handle Appliance Event Data ---
-            if 'applianceSignature' not in request_json:
-                return ('Missing applianceSignature data for ApplianceEvent type.', 400)
-            
-            appliance_signature_data = request_json['applianceSignature']
-            
-            # Use a separate collection for appliance events
-            doc_ref = firestore_client.collection('devices').document(device_id).collection('appliance_signatures').document(doc_id)
-            
             data_to_store = {
+                'deviceId': device_id,
                 'timestamp': timestamp_dt,
-                'kwhConsumed': float(kwh_consumed),
-                'currentAmp': float(current_amp),
-                'voltageVolt': float(voltage_volt),
-                'powerWatt': float(power_watt),
-                'energySource': energy_source,
-                'powerFactor': request_json.get('powerFactor', None),
-                'timestamp_esp32_raw': timestamp_mpy_int,
-                'signature_data': appliance_signature_data # Store the list of readings here
+                'signature_data': request_json['signature_data'],
+                'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
             }
+            doc_ref = firestore_client.collection('devices').document(device_id).collection('appliance_signatures').document(doc_id)
             doc_ref.set(data_to_store)
             print(f'Appliance signature stored for device: {device_id} at timestamp: {timestamp_dt.isoformat()}')
 
         elif data_type == 'RegularReading':
-            # --- Handle Regular Reading Data ---
-            doc_ref = firestore_client.collection('devices').document(device_id).collection('realtime_readings').document(doc_id)
+            # Handle regular reading data
+            required_fields = ['timestamp', 'kwhConsumed', 'currentAmp', 'voltageVolt', 'powerWatt']
+            for field in required_fields:
+                if field not in request_json:
+                    print(f'Missing required field: {field} in request body: {request_json}')
+                    return (f'Missing required data field: {field}.', 400)
+
+            timestamp_mpy_int = request_json['timestamp']
+            unix_timestamp_seconds = timestamp_mpy_int + EPOCH_OFFSET_SECONDS_1970_TO_2000
+            timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
+            doc_id = timestamp_dt.isoformat(timespec='seconds').replace('+00:00', 'Z').replace(':', '-')
 
             data_to_store = {
                 'timestamp': timestamp_dt,
-                'kwhConsumed': float(kwh_consumed),
-                'currentAmp': float(current_amp),
-                'voltageVolt': float(voltage_volt),
-                'powerWatt': float(power_watt),
-                'energySource': energy_source,
+                'kwhConsumed': float(request_json['kwhConsumed']),
+                'currentAmp': float(request_json['currentAmp']),
+                'voltageVolt': float(request_json['voltageVolt']),
+                'powerWatt': float(request_json['powerWatt']),
+                'energySource': request_json.get('energySource', 'Grid'),
                 'powerFactor': request_json.get('powerFactor', None),
                 'timestamp_esp32_raw': timestamp_mpy_int
             }
+            doc_ref = firestore_client.collection('devices').document(device_id).collection('realtime_readings').document(doc_id)
             doc_ref.set(data_to_store)
             print(f'Regular reading stored for device: {device_id} at timestamp: {timestamp_dt.isoformat()}')
-        
+
         else:
             return ('Invalid dataType provided.', 400)
 
-        return ('Data received successfully!', 200)
+        return ('Data received and processed successfully!', 200)
 
     except (ValueError, TypeError) as ve:
         print(f'Data conversion or format error: {ve}')
         return (f'Invalid data format: {ve}', 400)
     except Exception as e:
-        print(f'Error writing document to Firestore: {e}')
+        print(f'Error processing request and saving data: {e}')
         return (f'Error processing request and saving data: {e}', 500)
