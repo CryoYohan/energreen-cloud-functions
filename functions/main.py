@@ -31,41 +31,44 @@ def normalize_reading(reading):
     return r
 
 # -------------------------------
-# Appliance Prediction Model
+# Improved Appliance Prediction
 # -------------------------------
 def predict_appliance_type(signature_data):
     """
     A simple rule-based model to predict appliance type based on
-    average power consumption AND other key metrics.
+    average power consumption AND duration of signature.
     """
     if not signature_data:
         return 'Unknown'
 
-    # Check for readings
-    if len(signature_data) < 2:
-        return 'Unknown'
-    
-    # Analyze the transient and steady state
-    transient_readings = signature_data[:5]  # First few readings
-    steady_readings = signature_data[5:]    # Subsequent readings
+    # Normalize before prediction
+    normalized = [normalize_reading(d) for d in signature_data]
 
-    # Average the power readings for the steady state
-    if steady_readings:
-        total_power = sum(float(d.get('powerWatt', 0)) for d in steady_readings)
-        average_power = total_power / len(steady_readings)
+    total_power = sum(float(d.get('powerWatt', 0)) for d in normalized)
+    average_power = total_power / len(normalized)
+
+    # Estimate event duration
+    timestamps = [d.get("timestamp", 0) for d in normalized if "timestamp" in d]
+    duration = (max(timestamps) - min(timestamps)) if timestamps else 0
+
+    # Prediction rules: both power & duration
+    if average_power > 1500:
+        return 'Oven'
+    elif average_power > 1000:
+        return 'Electric Kettle'
+    elif average_power > 500:
+        return 'Microwave'
+    elif average_power > 100:
+        if duration < 30:
+            return 'Toaster'
+        else:
+            return 'Fan / Small Appliance'
+    elif average_power > 20:
+        return 'Lightbulb'
+    elif average_power >5:
+        return 'Small Load'
     else:
-        average_power = 0
-
-    # Analyze the transient peak
-    transient_peak = max(float(d.get('powerWatt', 0)) for d in transient_readings)
-
-    # Prediction rules based on power and other factors like power factor
-    # This is a simplified rule based on your bulb's profile.
-    if 2.5 < average_power < 3.5 and transient_peak < 10:
-        # A good way to identify a resistive/simple load like a bulb
-        return "5W Bulb"
-    else:
-        return "Unknown"
+        return 'Standby Power'
 
 # -------------------------------
 # Cloud Function Entry Point
