@@ -3,6 +3,7 @@ import google.cloud.firestore
 import datetime
 import json
 import math
+import sys
 
 # -------------------------------
 # Normalization Helper
@@ -62,8 +63,10 @@ def predict_appliance_type(signature_data):
             return 'Toaster'
         else:
             return 'Fan / Small Appliance'
-    elif average_power > 50:
+    elif average_power > 20:
         return 'Lightbulb'
+    elif average_power >5;
+        retrun 'Small Load'
     else:
         return 'Standby Power'
 
@@ -76,7 +79,12 @@ def receive_energy_data(request):
     HTTP Cloud Function to receive energy data from IoT devices and store it in Firestore.
     Expects a POST request with a JSON body containing energy readings.
     """
-    firestore_client = google.cloud.firestore.Client()
+    # Use a try-except block to catch initialization errors
+    try:
+        firestore_client = google.cloud.firestore.Client()
+    except Exception as e:
+        print(f"Firestore client initialization failed: {e}", file=sys.stderr)
+        return (f'Internal Server Error: Firestore client failed to initialize.', 500)
 
     if request.method != 'POST':
         return ('Method Not Allowed', 405)
@@ -84,58 +92,73 @@ def receive_energy_data(request):
     try:
         request_json = request.get_json(silent=True)
         if not request_json:
+            print("Request body is not valid JSON.", file=sys.stderr)
             return ('Request body must be JSON', 400)
     except Exception as e:
+        print(f'Error parsing JSON: {e}', file=sys.stderr)
         return (f'Error parsing JSON: {e}', 400)
 
     # Validate that 'dataType' and 'deviceId' are always present
     if 'dataType' not in request_json or 'deviceId' not in request_json:
+        print(f"Missing required data fields in payload: {request_json}", file=sys.stderr)
         return ('Missing required data fields: dataType or deviceId.', 400)
 
     data_type = request_json['dataType']
     device_id = request_json['deviceId']
+    
+    # CRUCIAL TIMESTAMP CONVERSION
+    # The ESP32 MicroPython utime.time() returns seconds since Jan 1, 2000.
+    # Unix epoch is Jan 1, 1970.
+    EPOCH_OFFSET_SECONDS_1970_TO_2000 = 946684800
 
     try:
-        # --- CRUCIAL TIMESTAMP CONVERSION ---
-        EPOCH_OFFSET_SECONDS_1970_TO_2000 = 946684800
-
         # -------------------------------
         # Appliance Signatures
         # -------------------------------
         if data_type == 'ApplianceSignature':
             if 'signature_data' not in request_json:
+                print("Missing signature_data for ApplianceSignature", file=sys.stderr)
                 return ('Missing required data field: signature_data for ApplianceSignature type.', 400)
 
             normalized_signature = [normalize_reading(d) for d in request_json['signature_data']]
 
-            # Use the timestamp from the first reading
             first_reading_timestamp_mpy = normalized_signature[0]['timestamp']
             unix_timestamp_seconds = first_reading_timestamp_mpy + EPOCH_OFFSET_SECONDS_1970_TO_2000
             timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
             doc_id = timestamp_dt.isoformat(timespec='seconds').replace('+00:00', 'Z').replace(':', '-')
 
-            # 1. Store raw signature data
-            data_to_store = {
-                'deviceId': device_id,
-                'timestamp': timestamp_dt,
-                'signature_data': normalized_signature,
-                'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
-            }
-            doc_ref = firestore_client.collection('devices').document(device_id).collection('appliance_signatures').document(doc_id)
-            doc_ref.set(data_to_store)
-            print(f'Appliance signature stored for device: {device_id} at {timestamp_dt.isoformat()}')
+            try:
+                # 1. Store raw signature data
+                data_to_store = {
+                    'deviceId': device_id,
+                    'timestamp': timestamp_dt,
+                    'signature_data': normalized_signature,
+                    'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
+                }
+                
+                doc_path_raw = f'devices/{device_id}/appliance_signatures/{doc_id}'
+                print(f"Attempting to write raw signature to Firestore at: {doc_path_raw}")
+                doc_ref = firestore_client.collection('devices').document(device_id).collection('appliance_signatures').document(doc_id)
+                doc_ref.set(data_to_store)
+                print(f'Appliance signature stored successfully for device: {device_id} at {timestamp_dt.isoformat()}')
 
-            # 2. Predict appliance type
-            predicted_appliance = predict_appliance_type(normalized_signature)
-            prediction_data = {
-                'deviceId': device_id,
-                'timestamp': timestamp_dt,
-                'predictedAppliance': predicted_appliance,
-                'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
-            }
-            prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predicted_appliances').document(doc_id)
-            prediction_doc_ref.set(prediction_data)
-            print(f'Prediction stored for device: {device_id}, Predicted appliance: {predicted_appliance}')
+                # 2. Predict appliance type
+                predicted_appliance = predict_appliance_type(normalized_signature)
+                prediction_data = {
+                    'deviceId': device_id,
+                    'timestamp': timestamp_dt,
+                    'predictedAppliance': predicted_appliance,
+                    'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
+                }
+                prediction_doc_path = f'devices/{device_id}/predicted_appliances/{doc_id}'
+                print(f"Attempting to write prediction to Firestore at: {prediction_doc_path}")
+                prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predicted_appliances').document(doc_id)
+                prediction_doc_ref.set(prediction_data)
+                print(f'Prediction stored successfully for device: {device_id}, Predicted appliance: {predicted_appliance}')
+
+            except Exception as firestore_error:
+                print(f'Firestore write error for ApplianceSignature: {firestore_error}', file=sys.stderr)
+                return (f'Internal Server Error: Firestore write failed.', 500)
 
         # -------------------------------
         # Regular Readings
@@ -144,7 +167,7 @@ def receive_energy_data(request):
             required_fields = ['timestamp', 'kwhConsumed', 'currentAmp', 'voltageVolt', 'powerWatt']
             for field in required_fields:
                 if field not in request_json:
-                    print(f'Missing required field: {field} in {request_json}')
+                    print(f'Missing required field: {field} in {request_json}', file=sys.stderr)
                     return (f'Missing required data field: {field}.', 400)
 
             normalized = normalize_reading(request_json)
@@ -154,28 +177,36 @@ def receive_energy_data(request):
             timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
             doc_id = timestamp_dt.isoformat(timespec='seconds').replace('+00:00', 'Z').replace(':', '-')
 
-            data_to_store = {
-                'timestamp': timestamp_dt,
-                'kwhConsumed': float(normalized['kwhConsumed']),
-                'currentAmp': float(normalized['currentAmp']),
-                'voltageVolt': float(normalized['voltageVolt']),
-                'powerWatt': float(normalized['powerWatt']),
-                'energySource': normalized.get('energySource', 'Grid'),
-                'powerFactor': normalized.get('powerFactor', None),
-                'timestamp_esp32_raw': timestamp_mpy_int
-            }
-            doc_ref = firestore_client.collection('devices').document(device_id).collection('realtime_readings').document(doc_id)
-            doc_ref.set(data_to_store)
-            print(f'Regular reading stored for device: {device_id} at {timestamp_dt.isoformat()}')
+            try:
+                data_to_store = {
+                    'timestamp': timestamp_dt,
+                    'kwhConsumed': float(normalized['kwhConsumed']),
+                    'currentAmp': float(normalized['currentAmp']),
+                    'voltageVolt': float(normalized['voltageVolt']),
+                    'powerWatt': float(normalized['powerWatt']),
+                    'energySource': normalized.get('energySource', 'Grid'),
+                    'powerFactor': normalized.get('powerFactor', None),
+                    'timestamp_esp32_raw': timestamp_mpy_int
+                }
+                
+                doc_path = f'devices/{device_id}/realtime_readings/{doc_id}'
+                print(f"Attempting to write regular reading to Firestore at: {doc_path}")
+                doc_ref = firestore_client.collection('devices').document(device_id).collection('realtime_readings').document(doc_id)
+                doc_ref.set(data_to_store)
+                print(f'Regular reading stored successfully for device: {device_id} at {timestamp_dt.isoformat()}')
+
+            except Exception as firestore_error:
+                print(f'Firestore write error for RegularReading: {firestore_error}', file=sys.stderr)
+                return (f'Internal Server Error: Firestore write failed.', 500)
 
         else:
             return ('Invalid dataType provided.', 400)
 
-        return ('Data received and processed successfully!', 200)
-
     except (ValueError, TypeError) as ve:
-        print(f'Data conversion or format error: {ve}')
+        print(f'Data conversion or format error: {ve}', file=sys.stderr)
         return (f'Invalid data format: {ve}', 400)
     except Exception as e:
-        print(f'Error processing request and saving data: {e}')
+        print(f'Generic error processing request and saving data: {e}', file=sys.stderr)
         return (f'Error processing request and saving data: {e}', 500)
+
+    return ('Data received and processed successfully!', 200)
