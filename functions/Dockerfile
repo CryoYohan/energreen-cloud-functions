@@ -14,4 +14,4 @@ COPY . .
 # Command to run the function using the functions-framework
 # --target is the name of your function
 # --source is the name of your Python file
-CMD ["functions-framework", "--target", "getApplianceSignatures", "--source", "getApplianceSignatures.py"]
+CMD ["functions-framework", "--target", "updateApplianceSignature", "--source", "updateApplianceSignature.py"]
