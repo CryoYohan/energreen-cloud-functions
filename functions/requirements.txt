@@ -1,12 +1,3 @@
-pandas
-lightgbm==4.3.0
-scikit-learn==1.3.2
-google-cloud-storage
-google-cloud-firestore
-functions-framework==3.5.0
-joblib==1.3.2
-functions-framework==3.*
 firebase-admin
-google-cloud-firestore
-PyJWT
-cryptography
+firebase-functions
+functions-framework
