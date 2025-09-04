@@ -65,7 +65,7 @@ def predict_appliance_type(signature_data):
             return 'Fan / Small Appliance'
     elif average_power > 20:
         return 'Lightbulb'
-    elif average_power >5:
+    elif average_power > 5:
         return 'Small Load'
     else:
         return 'Standby Power'
@@ -125,8 +125,7 @@ def receive_energy_data(request):
             first_reading_timestamp_mpy = normalized_signature[0]['timestamp']
             unix_timestamp_seconds = first_reading_timestamp_mpy + EPOCH_OFFSET_SECONDS_1970_TO_2000
             timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
-            doc_id = timestamp_dt.isoformat(timespec='seconds').replace('+00:00', 'Z').replace(':', '-')
-
+            
             try:
                 # 1. Store raw signature data
                 data_to_store = {
@@ -136,11 +135,10 @@ def receive_energy_data(request):
                     'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
                 }
                 
-                doc_path_raw = f'devices/{device_id}/appliance_signatures/{doc_id}'
-                print(f"Attempting to write raw signature to Firestore at: {doc_path_raw}")
-                doc_ref = firestore_client.collection('devices').document(device_id).collection('appliance_signatures').document(doc_id)
-                doc_ref.set(data_to_store)
-                print(f'Appliance signature stored successfully for device: {device_id} at {timestamp_dt.isoformat()}')
+                # Use add() to automatically generate a unique ID
+                collection_ref = firestore_client.collection('devices').document(device_id).collection('appliance_signatures')
+                doc_ref = collection_ref.add(data_to_store)
+                print(f'Appliance signature stored successfully for device: {device_id} with ID: {doc_ref[1].id}')
 
                 # 2. Predict appliance type
                 predicted_appliance = predict_appliance_type(normalized_signature)
@@ -150,10 +148,10 @@ def receive_energy_data(request):
                     'predictedAppliance': predicted_appliance,
                     'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
                 }
-                prediction_doc_path = f'devices/{device_id}/predicted_appliances/{doc_id}'
-                print(f"Attempting to write prediction to Firestore at: {prediction_doc_path}")
-                prediction_doc_ref = firestore_client.collection('devices').document(device_id).collection('predicted_appliances').document(doc_id)
-                prediction_doc_ref.set(prediction_data)
+                
+                # Use add() to automatically generate a unique ID for the prediction
+                prediction_collection_ref = firestore_client.collection('devices').document(device_id).collection('predicted_appliances')
+                prediction_doc_ref = prediction_collection_ref.add(prediction_data)
                 print(f'Prediction stored successfully for device: {device_id}, Predicted appliance: {predicted_appliance}')
 
             except Exception as firestore_error:
