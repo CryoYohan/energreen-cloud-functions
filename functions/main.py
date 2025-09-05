@@ -125,38 +125,49 @@ def receive_energy_data(request):
             first_reading_timestamp_mpy = normalized_signature[0]['timestamp']
             unix_timestamp_seconds = first_reading_timestamp_mpy + EPOCH_OFFSET_SECONDS_1970_TO_2000
             timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
-            
-            try:
-                # 1. Store raw signature data
-                data_to_store = {
-                    'deviceId': device_id,
-                    'timestamp': timestamp_dt,
-                    'signature_data': normalized_signature,
-                    'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
-                }
-                
-                # Use add() to automatically generate a unique ID
-                collection_ref = firestore_client.collection('devices').document(device_id).collection('appliance_signatures')
-                doc_ref = collection_ref.add(data_to_store)
-                print(f'Appliance signature stored successfully for device: {device_id} with ID: {doc_ref[1].id}')
 
-                # 2. Predict appliance type
-                predicted_appliance = predict_appliance_type(normalized_signature)
-                prediction_data = {
-                    'deviceId': device_id,
-                    'timestamp': timestamp_dt,
-                    'predictedAppliance': predicted_appliance,
-                    'processed_at': datetime.datetime.now(tz=datetime.timezone.utc)
+            try:
+                # Step 1: Store raw signature event in appliance_predictions
+                prediction_ref = firestore_client.collection("devices") \
+                    .document(device_id) \
+                    .collection("appliance_predictions") \
+                    .document()  # auto-ID
+
+                prediction_doc = {
+                    "deviceId": device_id,
+                    "timestamp": timestamp_dt,
+                    "signature": normalized_signature,
+                    "event_type": request_json.get("event_type", "unknown"),
+
+                    # 🟢 NEW fields for lifecycle + user labeling
+                    "status": "unidentified",        # user will confirm later
+                    "predicted_label": None,         # updated after rule/ML
+                    "confidence": None,              # updated after rule/ML
+                    "user_label": None,              # set by user in frontend
+                    "confirmed_at": None,            # when user confirms
+                    "created_at": datetime.datetime.now(tz=datetime.timezone.utc)
                 }
-                
-                # Use add() to automatically generate a unique ID for the prediction
-                prediction_collection_ref = firestore_client.collection('devices').document(device_id).collection('predicted_appliances')
-                prediction_doc_ref = prediction_collection_ref.add(prediction_data)
-                print(f'Prediction stored successfully for device: {device_id}, Predicted appliance: {predicted_appliance}')
+                prediction_ref.set(prediction_doc)
+
+                print(f'Appliance signature stored in appliance_predictions for device: {device_id} with ID: {prediction_ref.id}')
+
+                # Step 2: Run lightweight prediction (rule-based for now)
+                predicted_appliance = predict_appliance_type(normalized_signature)
+                confidence = 0.8  # placeholder until ML model is connected
+
+                # 🟢 update predicted fields
+                prediction_ref.update({
+                    "predicted_label": predicted_appliance,
+                    "confidence": confidence
+                })
+
+                print(f'Prediction updated: {predicted_appliance} ({confidence*100:.1f}%)')
 
             except Exception as firestore_error:
                 print(f'Firestore write error for ApplianceSignature: {firestore_error}', file=sys.stderr)
                 return (f'Internal Server Error: Firestore write failed.', 500)
+
+
 
         # -------------------------------
         # Regular Readings
