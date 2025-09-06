@@ -20,6 +20,8 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 import joblib
 
 from google.cloud import firestore
@@ -39,6 +41,11 @@ db = firestore.Client(project=PROJECT_ID)
 gcs_client = storage.Client(project=PROJECT_ID)
 
 app = FastAPI(title="NILM Train Model Service")
+
+
+@app.get("/")
+def root():
+    return {"message": "Training service is alive!"}
 
 # ---- Request schema ----
 class TrainRequest(BaseModel):
@@ -122,44 +129,75 @@ def signature_to_vector(sig: List[Dict[str, Any]], sample_len: int = SAMPLE_LENG
 
 def build_dataset_from_firestore(device_id: str, min_samples_per_class=MIN_SAMPLES_PER_CLASS):
     """
-    Query Firestore for confirmed appliance_predictions for device_id, convert to dataset (X, y).
-    Expects documents under: devices/{device_id}/appliance_predictions
-    Only uses docs with status == 'confirmed' and confirmed_label set.
+    Build dataset using both confirmed appliance_predictions (labeled)
+    and unlabeled appliance_signatures (clustered).
     """
-    coll = db.collection("devices").document(device_id).collection("appliance_predictions")
-    # Only confirmed labeled docs
-    docs = list(coll.where("status", "==", "confirmed").stream())
-    if not docs:
-        return None, None, "No confirmed appliance predictions found for device."
+    # --- 1) Supervised confirmed predictions ---
+    coll_pred = db.collection("devices").document(device_id).collection("appliance_predictions")
+    docs_pred = list(coll_pred.where("status", "==", "confirmed").stream())
 
-    X = []
-    y = []
-    meta = []
-    for d in docs:
+    X_labeled, y_labeled = [], []
+    for d in docs_pred:
         data = d.to_dict()
         label = data.get("confirmed_label") or data.get("label")
         signature = data.get("signature") or data.get("signature_data") or []
         if not label or not signature:
             continue
         vec = signature_to_vector(signature, SAMPLE_LENGTH)
-        X.append(vec)
-        y.append(label)
-        meta.append({"doc_id": d.id, "raw": data})
+        X_labeled.append(vec)
+        y_labeled.append(label)
+
+    # --- 2) Unsupervised raw signatures ---
+    coll_sig = db.collection("devices").document(device_id).collection("appliance_signatures")
+    docs_sig = list(coll_sig.stream())
+
+    X_unlabeled = []
+    for d in docs_sig:
+        data = d.to_dict()
+        signature = data.get("signature") or data.get("signature_data") or []
+        if not signature:
+            continue
+        vec = signature_to_vector(signature, SAMPLE_LENGTH)
+        X_unlabeled.append(vec)
+
+    # --- 3) Smarter clustering of unlabeled signatures ---
+    y_unlabeled = []
+    if X_unlabeled:
+        try:
+            max_clusters = min(8, len(X_unlabeled))  # don’t go crazy
+            best_score, best_k, best_labels = -1, 2, None
+            for k in range(2, max_clusters+1):
+                km = KMeans(n_clusters=k, random_state=42, n_init=10)
+                labels = km.fit_predict(X_unlabeled)
+                if len(set(labels)) > 1:  # valid clustering
+                    score = silhouette_score(X_unlabeled, labels)
+                    if score > best_score:
+                        best_score, best_k, best_labels = score, k, labels
+            if best_labels is not None:
+                y_unlabeled = [f"cluster_{c}" for c in best_labels]
+                logging.info(f"Clustering found {best_k} clusters with silhouette {best_score:.3f}")
+        except Exception as e:
+            logging.warning(f"Clustering failed: {e}")
+
+    # --- 4) Merge supervised + unsupervised ---
+    X = X_labeled + X_unlabeled
+    y = y_labeled + y_unlabeled
 
     if len(X) == 0:
         return None, None, "No usable signature data found."
 
-    # check class balance
-    df = pd.DataFrame({"label": y})
-    counts = df['label'].value_counts().to_dict()
-    insufficient = {k: v for k, v in counts.items() if v < min_samples_per_class}
-    if insufficient:
-        return np.array(X), np.array(y), {
-            "warning": "Some classes have few samples",
-            "counts": counts
-        }
+    # --- 5) Check balance on labeled part only ---
+    if y_labeled:
+        df = pd.DataFrame({"label": y_labeled})
+        counts = df['label'].value_counts().to_dict()
+        insufficient = {k: v for k, v in counts.items() if v < min_samples_per_class}
+        if insufficient:
+            return np.array(X), np.array(y), {
+                "warning": "Some labeled classes have few samples",
+                "counts": counts
+            }
 
-    return np.array(X), np.array(y), {"counts": counts}
+    return np.array(X), np.array(y), {"counts": {**(pd.Series(y).value_counts().to_dict())}}
 
 
 # ---- Endpoint: Train Model ----
@@ -209,7 +247,12 @@ async def train_model(req: TrainRequest):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
     # 3) Train a lightweight model (RandomForest)
-    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=1)
+    clf = RandomForestClassifier(
+        n_estimators=150,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced"  # <-- handles imbalance
+    )
     clf.fit(X_train, y_train)
 
     # 4) Evaluate
