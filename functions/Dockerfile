@@ -1,17 +1,21 @@
-# Use a base image with Python 3.11
+# Dockerfile for Cloud Run
 FROM python:3.11-slim
 
-# Set the working directory in the container
+# system deps for scikit-learn / pandas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gfortran \
+    libatlas-base-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Copy and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy your application code
-COPY . .
+COPY app.py .
 
-# Command to run the function using the functions-framework
-# --target is the name of your function
-# --source is the name of your Python file
-CMD ["functions-framework", "--target", "updateApplianceSignature", "--source", "updateApplianceSignature.py"]
+# set port for Cloud Run
+ENV PORT 8080
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
