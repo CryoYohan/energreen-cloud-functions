@@ -8,7 +8,7 @@ import math
 import os
 
 # Define the bucket and model file location
-MODEL_BUCKET_NAME = os.get_environment("MODEL_BUCKET")
+MODEL_BUCKET_NAME = os.environ.get("MODEL_BUCKET")
 MODEL_FILE_NAME = 'lightgbm_power_prediction_model_energreen_v2.joblib'
 
 # Initialize Firestore and GCS clients

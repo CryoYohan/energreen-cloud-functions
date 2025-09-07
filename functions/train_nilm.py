@@ -27,9 +27,10 @@ import joblib
 from google.cloud import firestore
 from google.cloud import storage
 
+
 # ---- Configuration (via env vars) ----
 PROJECT_ID = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
-GCS_BUCKET = os.environ.get("MODEL_BUCKET")          # e.g. "my-nilm-models-bucket"
+GCS_BUCKET = "energreen-prediction-model"     # e.g. "my-nilm-models-bucket"
 MIN_SAMPLES_PER_CLASS = int(os.environ.get("MIN_SAMPLES_PER_CLASS", "5"))
 SAMPLE_LENGTH = int(os.environ.get("SIGNATURE_SAMPLE_LEN", "12"))  # number of samples to use per signature
 
@@ -180,22 +181,16 @@ def build_dataset_from_firestore(device_id: str, min_samples_per_class=MIN_SAMPL
             logging.warning(f"Clustering failed: {e}")
 
     # --- 4) Merge supervised + unsupervised ---
-    X = X_labeled + X_unlabeled
-    y = y_labeled + y_unlabeled
+    X, y = X_labeled.copy(), y_labeled.copy()
 
-    if len(X) == 0:
-        return None, None, "No usable signature data found."
-
-    # --- 5) Check balance on labeled part only ---
-    if y_labeled:
-        df = pd.DataFrame({"label": y_labeled})
-        counts = df['label'].value_counts().to_dict()
-        insufficient = {k: v for k, v in counts.items() if v < min_samples_per_class}
-        if insufficient:
-            return np.array(X), np.array(y), {
-                "warning": "Some labeled classes have few samples",
-                "counts": counts
-            }
+    if X_unlabeled and best_labels is not None:
+        cluster_counts = pd.Series(best_labels).value_counts().to_dict()
+        for idx, vec in enumerate(X_unlabeled):
+            cluster_name = f"cluster_{best_labels[idx]}"
+            # only keep clusters with enough samples OR force flag
+            if cluster_counts[best_labels[idx]] >= min_samples_per_class or force:
+                X.append(vec)
+                y.append(cluster_name)
 
     return np.array(X), np.array(y), {"counts": {**(pd.Series(y).value_counts().to_dict())}}
 
