@@ -1,8 +1,5 @@
-# app.py
+# train_nilm.py
 # Cloud Run service: Train NILM single-label model from Firestore appliance signatures.
-# Expects POST /train-model with JSON: { "user_id": "...", "device_id": "...", "app_id": "optional-app-id" }
-# Requires GOOGLE_APPLICATION_CREDENTIALS environment variable to be set (service account JSON)
-# or default application credentials available to Cloud Run service.
 
 import os
 import time
@@ -11,7 +8,8 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
@@ -20,314 +18,236 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
 import joblib
 
 from google.cloud import firestore
 from google.cloud import storage
 
 
-# ---- Configuration (via env vars) ----
+# ---- Configuration ----
 PROJECT_ID = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
-GCS_BUCKET = "energreen-prediction-model"     # e.g. "my-nilm-models-bucket"
+GCS_BUCKET = "energreen-prediction-model"
 MIN_SAMPLES_PER_CLASS = int(os.environ.get("MIN_SAMPLES_PER_CLASS", "5"))
-SAMPLE_LENGTH = int(os.environ.get("SIGNATURE_SAMPLE_LEN", "12"))  # number of samples to use per signature
+SAMPLE_LENGTH = int(os.environ.get("SIGNATURE_SAMPLE_LEN", "12"))
 
-if not GCS_BUCKET:
-    logging.warning("MODEL_BUCKET env var not set — model upload will fail unless provided.")
-
-# Firestore & GCS clients (use ADC)
 db = firestore.Client(project=PROJECT_ID)
 gcs_client = storage.Client(project=PROJECT_ID)
 
 app = FastAPI(title="NILM Train Model Service")
+
+# ---- CORS ----
+FRONTEND_ORIGINS = [
+    "http://localhost:5173",    # local dev
+    "https://your-production-frontend.com",  # replace with real frontend
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
 def root():
     return {"message": "Training service is alive!"}
 
+
 # ---- Request schema ----
 class TrainRequest(BaseModel):
     user_id: str
     device_id: str
     app_id: Optional[str] = "default-app-id"
-    force: Optional[bool] = False  # if True, trains even if low samples (not recommended)
+    force: Optional[bool] = False
 
 
-# ---- Helper functions for feature extraction ----
+# ---- Feature extraction ----
 def signature_to_vector(sig: List[Dict[str, Any]], sample_len: int = SAMPLE_LENGTH):
-    """
-    Convert a signature (list of readings dicts) into a fixed-length numeric vector.
-    Strategy:
-      - Extract powerWatt series (float)
-      - Use last `sample_len` samples (pad with zeros on left if shorter)
-      - Also compute summary stats: mean, std, min, max, median, duration, energy (approx)
-    Returns concatenated vector (sample_len + summary_stats)
-    """
     if not sig:
-        # return zeros
-        series = [0.0] * sample_len
-        stats = [0.0] * 6
-        return np.array(series + stats, dtype=float)
+        return np.zeros(sample_len + 7, dtype=float)
 
-    # extract power series and timestamps (safe defaults)
     power = []
     timestamps = []
     for rec in sig:
-        pw = rec.get("powerWatt") or rec.get("power") or rec.get("power_watt") or 0.0
         try:
-            pw = float(pw)
+            pw = float(rec.get("powerWatt") or rec.get("power") or rec.get("power_watt") or 0.0)
         except Exception:
             pw = 0.0
         power.append(pw)
-        ts = rec.get("timestamp", None)
+
+        ts = rec.get("timestamp")
         try:
             timestamps.append(float(ts))
         except Exception:
             timestamps.append(None)
 
-    # convert to numpy
-    power = [float(x) for x in power]
-
-    # choose last sample_len values
+    # Pad or truncate power series
     if len(power) >= sample_len:
         series = power[-sample_len:]
     else:
-        # pad left with zeros so most recent samples are right-aligned
-        pad = [0.0] * (sample_len - len(power))
-        series = pad + power
+        series = [0.0] * (sample_len - len(power)) + power
 
-    # summary stats
-    arr = np.array(power) if len(power) > 0 else np.array([0.0])
-    mean = float(np.mean(arr))
-    std = float(np.std(arr))
-    mn = float(np.min(arr))
-    mx = float(np.max(arr))
-    med = float(np.median(arr))
+    arr = np.array(power) if power else np.array([0.0])
+    mean, std, mn, mx, med = (
+        float(np.mean(arr)),
+        float(np.std(arr)),
+        float(np.min(arr)),
+        float(np.max(arr)),
+        float(np.median(arr)),
+    )
 
-    # duration: approximate difference between last and first timestamp (if available)
     valid_ts = [t for t in timestamps if t is not None]
     if len(valid_ts) >= 2:
         duration = float(max(valid_ts) - min(valid_ts))
+        dt = (max(valid_ts) - min(valid_ts)) / max(1, len(valid_ts) - 1)
+        energy = float(np.sum(arr) * dt) / 3600.0
     else:
-        duration = float(len(power))  # fallback to count of samples
-
-    # approximate energy: sum(power) * dt (dt approximated as 1 second per sample if timestamp missing)
-    energy = 0.0
-    if len(valid_ts) >= 2:
-        # compute average dt
-        dt = (max(valid_ts) - min(valid_ts)) / max(1, len(valid_ts)-1)
-        energy = float(np.sum(arr) * dt) / 3600.0  # Wh -> kWh if arr in W and dt in seconds
-    else:
-        energy = float(np.sum(arr)) / 3600.0  # rough
+        duration = float(len(power))
+        energy = float(np.sum(arr)) / 3600.0
 
     stats = [mean, std, mn, mx, med, duration, energy]
-    # Return series + stats (series length + 7 stats)
     return np.array(series + stats, dtype=float)
 
 
+# ---- Dataset builder ----
+# ---- Dataset builder ----
 def build_dataset_from_firestore(device_id: str, min_samples_per_class=MIN_SAMPLES_PER_CLASS):
-    """
-    Build dataset using both confirmed appliance_predictions (labeled)
-    and unlabeled appliance_signatures (clustered).
-    """
-    # --- 1) Supervised confirmed predictions ---
-    coll_pred = db.collection("devices").document(device_id).collection("appliance_predictions")
-    docs_pred = list(coll_pred.where("status", "==", "confirmed").stream())
+    coll = db.collection("devices").document(device_id).collection("appliance_predictions")
+    docs = list(coll.stream())
 
-    X_labeled, y_labeled = [], []
-    for d in docs_pred:
+    X, y = [], []
+
+    for d in docs:
         data = d.to_dict()
-        label = data.get("confirmed_label") or data.get("label")
-        signature = data.get("signature") or data.get("signature_data") or []
-        if not label or not signature:
+
+        # ✅ Only keep records with confirmed_label
+        label = data.get("confirmed_label")
+        if not label or str(label).lower() in ["unknown", "unidentified", "none"]:
             continue
-        vec = signature_to_vector(signature, SAMPLE_LENGTH)
-        X_labeled.append(vec)
-        y_labeled.append(label)
 
-    # --- 2) Unsupervised raw signatures ---
-    coll_sig = db.collection("devices").document(device_id).collection("appliance_signatures")
-    docs_sig = list(coll_sig.stream())
-
-    X_unlabeled = []
-    for d in docs_sig:
-        data = d.to_dict()
-        signature = data.get("signature") or data.get("signature_data") or []
-        if not signature:
+        sig = data.get("signature")
+        if not sig or not isinstance(sig, list):
             continue
-        vec = signature_to_vector(signature, SAMPLE_LENGTH)
-        X_unlabeled.append(vec)
 
-    # --- 3) Smarter clustering of unlabeled signatures ---
-    y_unlabeled = []
-    if X_unlabeled:
         try:
-            max_clusters = min(8, len(X_unlabeled))  # don’t go crazy
-            best_score, best_k, best_labels = -1, 2, None
-            for k in range(2, max_clusters+1):
-                km = KMeans(n_clusters=k, random_state=42, n_init=10)
-                labels = km.fit_predict(X_unlabeled)
-                if len(set(labels)) > 1:  # valid clustering
-                    score = silhouette_score(X_unlabeled, labels)
-                    if score > best_score:
-                        best_score, best_k, best_labels = score, k, labels
-            if best_labels is not None:
-                y_unlabeled = [f"cluster_{c}" for c in best_labels]
-                logging.info(f"Clustering found {best_k} clusters with silhouette {best_score:.3f}")
+            vec = signature_to_vector(sig, SAMPLE_LENGTH)
         except Exception as e:
-            logging.warning(f"Clustering failed: {e}")
+            logging.warning(f"Skipping malformed doc: {e}")
+            continue
 
-    # --- 4) Merge supervised + unsupervised ---
-    X, y = X_labeled.copy(), y_labeled.copy()
+        X.append(vec)
+        y.append(label)
 
-    if X_unlabeled and best_labels is not None:
-        cluster_counts = pd.Series(best_labels).value_counts().to_dict()
-        for idx, vec in enumerate(X_unlabeled):
-            cluster_name = f"cluster_{best_labels[idx]}"
-            # only keep clusters with enough samples OR force flag
-            if cluster_counts[best_labels[idx]] >= min_samples_per_class or force:
-                X.append(vec)
-                y.append(cluster_name)
+    # Convert to arrays
+    X, y = np.array(X), np.array(y)
+    counts = pd.Series(y).value_counts().to_dict() if len(y) else {}
 
-    return np.array(X), np.array(y), {"counts": {**(pd.Series(y).value_counts().to_dict())}}
+    # Filter out classes with too few samples
+    classes_to_keep = [lbl for lbl, cnt in counts.items() if cnt >= min_samples_per_class]
+    mask = np.isin(y, classes_to_keep)
+    X, y = X[mask], y[mask]
+
+    return X, y, {"counts": counts}
 
 
-# ---- Endpoint: Train Model ----
+
+
+# ---- Train Model ----
 @app.post("/train-model")
 async def train_model(req: TrainRequest):
     start_ts = time.time()
-    # Validate
+
     if not req.user_id or not req.device_id:
         raise HTTPException(status_code=400, detail="user_id and device_id are required")
 
-    device_id = req.device_id
-    user_id = req.user_id
-    app_id = req.app_id or "default-app-id"
+    X, y, info = build_dataset_from_firestore(req.device_id)
 
-    # 1) Build dataset
-    dataset = build_dataset_from_firestore(device_id)
-    if dataset is None:
-        raise HTTPException(status_code=404, detail="No confirmed appliance signatures found for this device.")
-
-    X, y, info = dataset
-    # If info is a dict warning, and force flag is False, reject
-    if isinstance(info, dict) and info.get("warning") and not req.force:
+    if len(y) == 0:
         return {
             "status": "failed",
-            "reason": "insufficient_samples",
-            "message": "Some classes do not meet minimum sample count. Use force=true to override.",
-            "details": info
+            "reason": "no_data",
+            "message": "No confirmed appliance signatures found for this device."
         }
 
-    # Convert X,y to numeric/dtype
-    try:
-        X = np.array(X, dtype=float)
-        y = np.array(y)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to construct numpy arrays: {e}")
-
-    # Ensure at least 2 classes
     unique_labels = np.unique(y)
-    if len(unique_labels) < 2:
+    if len(unique_labels) < 2 and not req.force:
         return {
-            "status": "failed",
-            "reason": "not_enough_classes",
-            "message": "Need at least two different appliance labels to train a classifier."
+            "status": "warning",
+            "reason": "single_class",
+            "message": "Only one device class available, training with UNKNOWN fallback.",
+            "labels": list(map(str, unique_labels))
         }
 
-    # 2) Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
-
-    # 3) Train a lightweight model (RandomForest)
-    clf = RandomForestClassifier(
-        n_estimators=150,
-        random_state=42,
-        n_jobs=-1,
-        class_weight="balanced"  # <-- handles imbalance
-    )
-    clf.fit(X_train, y_train)
-
-    # 4) Evaluate
-    y_pred = clf.predict(X_test)
-    acc = float(accuracy_score(y_test, y_pred))
-    report = classification_report(y_test, y_pred, output_dict=True)
-
-    # 5) Save model to GCS
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    model_name = f"rf_model_{timestamp}.pkl"
-    gcs_path = f"models/{user_id}/{device_id}/{model_name}"
-
-    # Dump model to bytes via joblib
-    buf = io.BytesIO()
-    joblib.dump(clf, buf)
-    buf.seek(0)
-
-    if not GCS_BUCKET:
-        raise HTTPException(status_code=500, detail="GCS bucket not configured (set MODEL_BUCKET env var).")
-
     try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, stratify=y if len(unique_labels) > 1 else None, random_state=42
+        )
+
+        clf = RandomForestClassifier(
+            n_estimators=150, random_state=42, n_jobs=-1, class_weight="balanced"
+        )
+        clf.fit(X_train, y_train)
+
+        y_pred = clf.predict(X_test)
+        acc = float(accuracy_score(y_test, y_pred)) if len(y_test) > 0 else 1.0
+        report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+
+        # Save model
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        model_name = f"rf_model_{timestamp}.pkl"
+        gcs_path = f"models/{req.user_id}/{req.device_id}/{model_name}"
+
+        buf = io.BytesIO()
+        joblib.dump(clf, buf)
+        buf.seek(0)
+
         bucket = gcs_client.bucket(GCS_BUCKET)
         blob = bucket.blob(gcs_path)
         blob.upload_from_file(buf, content_type="application/octet-stream")
         model_gcs_uri = f"gs://{GCS_BUCKET}/{gcs_path}"
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to upload model to GCS: {e}")
 
-    # 6) Write model metadata to Firestore
-    models_coll = db.collection("devices").document(device_id).collection("models")
-    model_doc = {
-        "user_id": user_id,
-        "device_id": device_id,
-        "app_id": app_id,
-        "model_name": model_name,
-        "model_gcs_uri": model_gcs_uri,
-        "created_at": datetime.now(timezone.utc),
-        "metrics": {
-            "accuracy": acc,
-            "report": report
-        },
-        "training_sample_count": int(len(y)),
-        "labels": list(map(str, unique_labels))
-    }
-    try:
+        # Write Firestore metadata
+        models_coll = db.collection("devices").document(req.device_id).collection("models")
+        model_doc = {
+            "user_id": req.user_id,
+            "device_id": req.device_id,
+            "app_id": req.app_id,
+            "model_name": model_name,
+            "model_gcs_uri": model_gcs_uri,
+            "created_at": datetime.now(timezone.utc),
+            "metrics": {"accuracy": acc, "report": report},
+            "training_sample_count": int(len(y)),
+            "labels": list(map(str, unique_labels)),
+        }
         model_ref = models_coll.document()
         model_ref.set(model_doc)
         model_id = model_ref.id
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to write model metadata to Firestore: {e}")
 
-    # 7) Optionally annotate appliance_predictions with latest_model reference (not required)
-    try:
-        predictions_coll = db.collection("devices").document(device_id).collection("appliance_predictions")
-        # write model reference into device top-level doc for quick lookup
-        device_doc_ref = db.collection("devices").document(device_id)
-        device_doc_ref.set({
-            "latest_model": {
+        # Update latest_model
+        db.collection("devices").document(req.device_id).set(
+            {"latest_model": {
                 "model_id": model_id,
                 "model_name": model_name,
                 "model_gcs_uri": model_gcs_uri,
                 "created_at": datetime.now(timezone.utc)
-            }
-        }, merge=True)
-    except Exception:
-        # Not critical, log but don't fail the endpoint
-        logging.exception("Warning: failed to update device latest_model metadata.")
+            }},
+            merge=True
+        )
 
-    duration = time.time() - start_ts
-    return {
-        "status": "success",
-        "model_id": model_id,
-        "model_name": model_name,
-        "model_gcs_uri": model_gcs_uri,
-        "metrics": {
-            "accuracy": acc,
-            "report": report
-        },
-        "training_time_seconds": duration
-    }
+        return {
+            "status": "success",
+            "model_id": model_id,
+            "model_name": model_name,
+            "model_gcs_uri": model_gcs_uri,
+            "metrics": {"accuracy": acc, "report": report},
+            "training_time_seconds": time.time() - start_ts
+        }
+
+    except Exception as e:
+        logging.exception("Training error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
