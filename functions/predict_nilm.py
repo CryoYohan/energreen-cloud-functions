@@ -3,8 +3,7 @@ import os
 import io
 import logging
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any
@@ -26,7 +25,7 @@ app = FastAPI(title="NILM Predict Appliance Service")
 
 # ---- CORS configuration ----
 FRONTEND_ORIGINS = [
-    "http://localhost:5173",   # local dev
+    "http://localhost:5173",    # local dev
     "https://your-production-frontend.com",  # replace with real frontend URL
 ]
 
@@ -41,10 +40,28 @@ app.add_middleware(
 # ---- Model cache ----
 _model_cache = {}
 
-# ---- Request schema ----
-class PredictRequest(BaseModel):
+# ---- New Request and Response Schemas ----
+
+class ApplianceSignature(BaseModel):
+    # This is the unique ID of the Firestore document for the signature
+    _id: str 
+    signature: List[Dict[str, Any]]
+
+class BatchPredictRequest(BaseModel):
     device_id: str
-    signature: List[Dict[str, Any]]  # list of power readings dicts
+    signatures: List[ApplianceSignature]
+
+class PredictionResult(BaseModel):
+    _id: str
+    predicted_label: str
+    predicted_probabilities: Dict[str, float] | None = None
+    
+class BatchPredictResponse(BaseModel):
+    device_id: str
+    predictions: List[PredictionResult]
+    model_used: str
+    timestamp: str
+
 
 # ---- Vectorization function ----
 SAMPLE_LENGTH = 12
@@ -109,28 +126,56 @@ def load_latest_model(device_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to load model from GCS: {e}")
 
 # ---- Predict endpoint ----
-@app.post("/predict-appliance")
-async def predict_appliance(req: PredictRequest):
-    if not req.device_id or not req.signature:
-        raise HTTPException(status_code=400, detail="device_id and signature are required")
+@app.post("/predict-appliance", response_model=BatchPredictResponse)
+async def predict_appliance(req: BatchPredictRequest):
+    if not req.device_id or not req.signatures:
+        raise HTTPException(status_code=400, detail="device_id and signatures list are required")
 
     clf = load_latest_model(req.device_id)
-    X_vec = signature_to_vector(req.signature).reshape(1, -1)
+    
+    predictions = []
+    
+    # Initialize a Firestore batch
+    batch = db.batch()
+    
+    for signature_data in req.signatures:
+        X_vec = signature_to_vector(signature_data.signature).reshape(1, -1)
+        
+        try:
+            pred_label = clf.predict(X_vec)[0]
+            pred_proba = None
+            if hasattr(clf, "predict_proba"):
+                proba = clf.predict_proba(X_vec)[0]
+                classes = clf.classes_
+                pred_proba = {str(classes[i]): float(proba[i]) for i in range(len(classes))}
+        except Exception as e:
+            logging.error(f"Prediction failed for signature_id {signature_data._id}: {e}")
+            pred_label = "unknown"
+            pred_proba = None
+        
+        # Add update operation to the Firestore batch
+        appliance_doc_ref = db.collection("devices").document(req.device_id).collection("appliance_predictions").document(signature_data._id)
+        batch.update(appliance_doc_ref, {
+            "predicted_label": pred_label,
+            "confidence": pred_proba.get(pred_label, None) if pred_proba else None,
+            "updated_at": firestore.SERVER_TIMESTAMP
+        })
+        
+        # Append the prediction to the response list
+        predictions.append(
+            PredictionResult(
+                _id=signature_data._id,
+                predicted_label=pred_label,
+                predicted_probabilities=pred_proba
+            )
+        )
 
-    try:
-        pred_label = clf.predict(X_vec)[0]
-        pred_proba = None
-        if hasattr(clf, "predict_proba"):
-            proba = clf.predict_proba(X_vec)[0]
-            classes = clf.classes_
-            pred_proba = {str(classes[i]): float(proba[i]) for i in range(len(classes))}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
-
-    return {
-        "device_id": req.device_id,
-        "predicted_label": pred_label,
-        "predicted_probabilities": pred_proba,
-        "model_used": getattr(clf, "model_name", "unknown"),
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
+    # Commit the Firestore batch
+    batch.commit()
+    
+    return BatchPredictResponse(
+        device_id=req.device_id,
+        predictions=predictions,
+        model_used=getattr(clf, "model_name", "unknown"),
+        timestamp=datetime.now(timezone.utc).isoformat()
+    )
