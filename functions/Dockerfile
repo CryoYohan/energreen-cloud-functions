@@ -1,13 +1,18 @@
-# Use the official Python image as a base
+# Use lightweight Python image
 FROM python:3.11-slim
-# Set a working directory inside the container
+
+# Set working directory
 WORKDIR /app
-# Copy the requirements file and install dependencies
+
+# Copy requirements first for caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# Copy the rest of your application source code
+
+# Copy code
 COPY . .
-# Expose the port that the application will run on
+
+# Expose port
 EXPOSE 8080
-# The command to run your application using Uvicorn
-CMD ["uvicorn", "cluster_nilm:app", "--host", "0.0.0.0", "--port", "8080"]
+
+# Run FastAPI with Uvicorn
+CMD ["uvicorn", "train_nilm:app", "--host", "0.0.0.0", "--port", "8080"]

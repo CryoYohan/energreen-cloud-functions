@@ -112,37 +112,65 @@ def signature_to_vector(sig: List[Dict[str, Any]], sample_len: int = SAMPLE_LENG
 
 
 # ---- Dataset builder ----
-# ---- Dataset builder ----
 def build_dataset_from_firestore(device_id: str, min_samples_per_class=MIN_SAMPLES_PER_CLASS):
-    coll = db.collection("devices").document(device_id).collection("appliance_predictions")
-    docs = list(coll.stream())
+    confirmed_coll = db.collection("devices").document(device_id).collection("confirmed_appliances")
+    confirmed_docs = list(confirmed_coll.stream())
 
     X, y = [], []
 
-    for d in docs:
+    logging.info(f"Found {len(confirmed_docs)} confirmed_appliances for device {device_id}")
+
+    for d in confirmed_docs:
         data = d.to_dict()
 
-        # ✅ Only keep records with confirmed_label
-        label = data.get("confirmed_label")
+        # ✅ user_label is at the root level
+        label = data.get("user_label")
         if not label or str(label).lower() in ["unknown", "unidentified", "none"]:
             continue
 
-        sig = data.get("signature")
-        if not sig or not isinstance(sig, list):
+        # ✅ signatures are inside summary map
+        summary = data.get("summary", {})
+        signature_ids = summary.get("signatures", [])
+
+        if not isinstance(signature_ids, list) or not label:
             continue
 
-        try:
-            vec = signature_to_vector(sig, SAMPLE_LENGTH)
-        except Exception as e:
-            logging.warning(f"Skipping malformed doc: {e}")
-            continue
 
-        X.append(vec)
-        y.append(label)
+        logging.info(f"Confirmed appliance with label '{label}' has {len(signature_ids)} signatures")
+
+        for sig_id in signature_ids:
+            try:
+                # fetch actual signature from appliance_predictions
+                pred_ref = (
+                    db.collection("devices")
+                    .document(device_id)
+                    .collection("appliance_predictions")
+                    .document(sig_id)
+                )
+                pred_doc = pred_ref.get()
+                if not pred_doc.exists:
+                    logging.warning(f"Signature doc {sig_id} not found in appliance_predictions")
+                    continue
+
+                pred_data = pred_doc.to_dict()
+                sig = pred_data.get("signature")
+                if not sig or not isinstance(sig, list):
+                    logging.warning(f"Signature doc {sig_id} missing 'signature' array")
+                    continue
+
+                vec = signature_to_vector(sig, SAMPLE_LENGTH)
+                X.append(vec)
+                y.append(label)
+
+            except Exception as e:
+                logging.warning(f"Skipping malformed signature {sig_id}: {e}")
+                continue
 
     # Convert to arrays
     X, y = np.array(X), np.array(y)
     counts = pd.Series(y).value_counts().to_dict() if len(y) else {}
+
+    logging.info(f"Built dataset with {len(X)} samples across {len(set(y))} classes: {counts}")
 
     # Filter out classes with too few samples
     classes_to_keep = [lbl for lbl, cnt in counts.items() if cnt >= min_samples_per_class]
@@ -150,9 +178,6 @@ def build_dataset_from_firestore(device_id: str, min_samples_per_class=MIN_SAMPL
     X, y = X[mask], y[mask]
 
     return X, y, {"counts": counts}
-
-
-
 
 # ---- Train Model ----
 @app.post("/train-model")
