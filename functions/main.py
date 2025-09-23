@@ -3,6 +3,7 @@ import google.cloud.firestore
 import datetime
 import json
 import math
+import statistics
 import sys
 
 # -------------------------------
@@ -29,6 +30,46 @@ def normalize_reading(reading):
         r['kwhConsumed'] = r['kwhConsumed'] / 1000.0
 
     return r
+
+
+# -------------------------------
+# Feature Extraction Helpers
+# -------------------------------
+def summarize_transient(data):
+    """Extract transient summary features from normalized list of readings."""
+    if not data:
+        return None
+    powers = [d['powerWatt'] for d in data]
+    timestamps = [d['timestamp'] for d in data]
+
+    peak_power = max(powers)
+    energy = sum(powers) * 1  # assuming 1s sample spacing (adjust if ESP32 sends faster)
+    rise_time = (timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0
+
+    return {
+        "peak_power": float(peak_power),
+        "energy": float(energy),
+        "rise_time": float(rise_time)
+    }
+
+
+def summarize_steady(data):
+    """Extract steady-state summary features from normalized list of readings."""
+    if not data:
+        return None
+    powers = [d['powerWatt'] for d in data]
+    currents = [d['currentAmp'] for d in data]
+    pfs = [d.get('powerFactor', 0.0) for d in data]
+    voltages = [d['voltageVolt'] for d in data]
+
+    return {
+        "mean_power": float(statistics.mean(powers)),
+        "std_power": float(statistics.pstdev(powers)) if len(powers) > 1 else 0.0,
+        "pf_mean": float(statistics.mean(pfs)),
+        "current_rms": float(statistics.mean(currents)),
+        "voltage_mean": float(statistics.mean(voltages)),
+        "voltage_std": float(statistics.pstdev(voltages)) if len(voltages) > 1 else 0.0
+    }
 
 
 # -------------------------------
@@ -69,15 +110,20 @@ def receive_energy_data(request):
         # Appliance Signatures
         # -------------------------------
         if data_type == 'ApplianceSignature':
-            if 'signature_data' not in request_json:
-                return ('Missing required data field: signature_data for ApplianceSignature.', 400)
+            if 'transient_data' not in request_json or 'steady_state_data' not in request_json:
+                return ('Missing required data fields: transient_data or steady_state_data.', 400)
 
-            normalized_signature = [normalize_reading(d) for d in request_json['signature_data']]
-            first_reading_timestamp_mpy = normalized_signature[0]['timestamp']
+            normalized_transient = [normalize_reading(d) for d in request_json['transient_data']]
+            normalized_steady = [normalize_reading(d) for d in request_json['steady_state_data']]
+
+            # summaries
+            transient_summary = summarize_transient(normalized_transient)
+            steady_summary = summarize_steady(normalized_steady)
+
+            first_reading_timestamp_mpy = normalized_transient[0]['timestamp']
             unix_timestamp_seconds = first_reading_timestamp_mpy + EPOCH_OFFSET_SECONDS_1970_TO_2000
             timestamp_dt = datetime.datetime.fromtimestamp(unix_timestamp_seconds, tz=datetime.timezone.utc)
 
-            # Step 1: Store raw signature in appliance_predictions
             prediction_ref = firestore_client.collection("devices") \
                 .document(device_id) \
                 .collection("appliance_predictions") \
@@ -86,21 +132,27 @@ def receive_energy_data(request):
             prediction_doc = {
                 "deviceId": device_id,
                 "timestamp": timestamp_dt,
-                "signature": normalized_signature,
                 "event_type": request_json.get("event_type", "unknown"),
-
-                # 🔹 Lifecycle fields
-                "status": "unidentified",   # starts as unidentified
-                "cluster_id": None,         # assigned later by clustering
-                "predicted_label": None,    # clustering/ML adds this later
+                "transient_data": normalized_transient,
+                "steady_state_data": normalized_steady,
+                "transient_summary": transient_summary,
+                "steady_summary": steady_summary,
+                # lifecycle fields
+                "status": "unidentified",
+                "cluster_id": None,
+                "predicted_label": None,
                 "confidence": None,
-                "user_label": None,         # set only when user confirms
+                "user_label": "LED Bulb 3W",
                 "confirmed_at": None,
-                "created_at": datetime.datetime.now(tz=datetime.timezone.utc)
+                "created_at": datetime.datetime.now(tz=datetime.timezone.utc),
+                "capture_settings": {
+                    "sample_interval_s": 1,
+                    "event_duration_s": len(normalized_transient) + len(normalized_steady)
+                }
             }
-            prediction_ref.set(prediction_doc)
 
-            print(f'Appliance signature stored: {prediction_ref.id}')
+            prediction_ref.set(prediction_doc)
+            print(f'Appliance signature stored with summaries: {prediction_ref.id}')
 
 
         # -------------------------------
