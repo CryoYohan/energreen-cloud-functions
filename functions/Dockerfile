@@ -9,10 +9,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy code
-COPY . .
+COPY bridge.py .
+COPY isrgrootx1.pem .
 
-# Expose port
-EXPOSE 8080
-
-# Run FastAPI with Uvicorn
-CMD ["uvicorn", "train_nilm:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run the MQTT-to-Pub/Sub bridge script
+CMD ["python", "bridge.py"]

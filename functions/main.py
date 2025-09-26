@@ -5,6 +5,7 @@ import json
 import math
 import statistics
 import sys
+import base64
 
 # -------------------------------
 # Normalization Helper
@@ -31,7 +32,6 @@ def normalize_reading(reading):
 
     return r
 
-
 # -------------------------------
 # Feature Extraction Helpers
 # -------------------------------
@@ -52,7 +52,6 @@ def summarize_transient(data):
         "rise_time": float(rise_time)
     }
 
-
 def summarize_steady(data):
     """Extract steady-state summary features from normalized list of readings."""
     if not data:
@@ -71,34 +70,33 @@ def summarize_steady(data):
         "voltage_std": float(statistics.pstdev(voltages)) if len(voltages) > 1 else 0.0
     }
 
-
 # -------------------------------
 # Cloud Function Entry Point
 # -------------------------------
-@functions_framework.http
-def receive_energy_data(request):
+@functions_framework.cloud_event
+def receive_energy_data_v2(cloud_event):
     """
-    HTTP Cloud Function to receive energy data from IoT devices and store it in Firestore.
+    Pub/Sub Cloud Function to receive energy data from IoT devices and store it in Firestore.
     Handles both RegularReading and ApplianceSignature.
+    Triggered by messages published to the 'iot-telemetry' topic.
     """
     try:
         firestore_client = google.cloud.firestore.Client()
     except Exception as e:
         print(f"Firestore client initialization failed: {e}", file=sys.stderr)
-        return ('Internal Server Error: Firestore client failed to initialize.', 500)
-
-    if request.method != 'POST':
-        return ('Method Not Allowed', 405)
+        raise
 
     try:
-        request_json = request.get_json(silent=True)
-        if not request_json:
-            return ('Request body must be JSON', 400)
+        # Parse Pub/Sub message (data is base64-encoded JSON from ESP32)
+        message_data = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
+        request_json = json.loads(message_data)
     except Exception as e:
-        return (f'Error parsing JSON: {e}', 400)
+        print(f'Error parsing Pub/Sub message: {e}', file=sys.stderr)
+        raise
 
     if 'dataType' not in request_json or 'deviceId' not in request_json:
-        return ('Missing required data fields: dataType or deviceId.', 400)
+        print('Missing required data fields: dataType or deviceId.', file=sys.stderr)
+        return
 
     data_type = request_json['dataType']
     device_id = request_json['deviceId']
@@ -111,12 +109,13 @@ def receive_energy_data(request):
         # -------------------------------
         if data_type == 'ApplianceSignature':
             if 'transient_data' not in request_json or 'steady_state_data' not in request_json:
-                return ('Missing required data fields: transient_data or steady_state_data.', 400)
+                print('Missing required data fields: transient_data or steady_state_data.', file=sys.stderr)
+                return
 
             normalized_transient = [normalize_reading(d) for d in request_json['transient_data']]
             normalized_steady = [normalize_reading(d) for d in request_json['steady_state_data']]
 
-            # summaries
+            # Summaries
             transient_summary = summarize_transient(normalized_transient)
             steady_summary = summarize_steady(normalized_steady)
 
@@ -137,7 +136,7 @@ def receive_energy_data(request):
                 "steady_state_data": normalized_steady,
                 "transient_summary": transient_summary,
                 "steady_summary": steady_summary,
-                # lifecycle fields
+                # Lifecycle fields
                 "status": "unidentified",
                 "cluster_id": None,
                 "predicted_label": None,
@@ -154,7 +153,6 @@ def receive_energy_data(request):
             prediction_ref.set(prediction_doc)
             print(f'Appliance signature stored with summaries: {prediction_ref.id}')
 
-
         # -------------------------------
         # Regular Readings
         # -------------------------------
@@ -162,7 +160,8 @@ def receive_energy_data(request):
             required_fields = ['timestamp', 'kwhConsumed', 'currentAmp', 'voltageVolt', 'powerWatt']
             for field in required_fields:
                 if field not in request_json:
-                    return (f'Missing required data field: {field}.', 400)
+                    print(f'Missing required data field: {field}.', file=sys.stderr)
+                    return
 
             normalized = normalize_reading(request_json)
             timestamp_mpy_int = normalized['timestamp']
@@ -187,10 +186,9 @@ def receive_energy_data(request):
             print(f'Regular reading stored at {doc_id}')
 
         else:
-            return ('Invalid dataType provided.', 400)
+            print('Invalid dataType provided.', file=sys.stderr)
+            return
 
     except Exception as e:
         print(f'Error processing data: {e}', file=sys.stderr)
-        return (f'Error processing data: {e}', 500)
-
-    return ('Data received and processed successfully!', 200)
+        raise
